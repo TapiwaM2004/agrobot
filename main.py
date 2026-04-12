@@ -4,6 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 import httpx
 import os
+import threading
+import time
 import json
 import base64
 import math
@@ -116,6 +118,10 @@ payment_pending = {}
 user_accounts = {}
 market_prices = {}
 community_posts = []
+support_tickets ={}
+notifications = []
+admin_updates = []
+payment_checks ={}
 community_channels = {
     "general": {"name": "🌍 General Farming", "description": "All farming topics", "messages": []},
     "maize": {"name": "🌽 Maize Farmers", "description": "Maize growing community", "messages": []},
@@ -158,6 +164,23 @@ def load_data():
                     var.update(data)
         except:
             pass
+    try:
+        with open("support_tickets.json", "r") as f:
+            support_tickets.update(json.load(f))
+    except:
+        pass
+
+    try:
+        with open("notifications.json", "r") as f:
+            notifications.extend(json.load(f))
+    except:
+        pass
+
+    try:
+        with open("admin_updates.json", "r") as f:
+            admin_updates.extend(json.load(f))
+    except:
+        pass
 
 def save_data():
     data_map = {
@@ -179,6 +202,12 @@ def save_data():
                 json.dump(data, f, indent=2)
         except Exception as e:
             print(f"Save error {fname}: {e}")
+with open("support_tickets.json", "w") as f:
+            json.dump(support_tickets, f, indent=2)
+            with open("notifications.json", "w") as f:
+             json.dump(notifications, f, indent=2)
+            with open("admin_updates.json", "w") as f:
+             json.dump(admin_updates, f, indent=2)
 
 load_data()
 
@@ -3019,6 +3048,720 @@ async def refresh_prices_background():
             print(f"Price refresh error: {e}")
         await asyncio.sleep(21600)  # 6 hours
 
+# ══════════════════════════════════════════════════════════════
+# ── SUPPORT TICKET SYSTEM ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+@app.post("/api/support/ticket")
+async def create_support_ticket(request: Request):
+    """User submits a support query"""
+    body = await request.json()
+    phone = body.get("phone", "")
+    subject = body.get("subject", "")
+    message = body.get("message", "")
+    category = body.get("category", "general")
+
+    if not phone or not message:
+        return JSONResponse({"error": "Phone and message required"}, status_code=400)
+
+    ticket_id = f"TKT{secrets.token_hex(4).upper()}"
+    ticket = {
+        "id": ticket_id,
+        "phone": phone,
+        "subject": subject,
+        "message": message,
+        "category": category,
+        "status": "open",
+        "created": datetime.datetime.now().isoformat(),
+        "replies": [],
+        "resolved": False
+    }
+
+    if phone not in support_tickets:
+        support_tickets[phone] = []
+    support_tickets[phone].append(ticket)
+    save_data()
+
+    # Send WhatsApp confirmation to user
+    send_whatsapp_message(phone,
+        f"""✅ *Support Ticket Created*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+🎫 Ticket ID: *{ticket_id}*
+📋 Subject: {subject}
+📊 Status: *Open*
+
+We will respond within 24 hours.
+📞 Urgent: {SUPPORT_PHONE}
+📧 {SUPPORT_EMAIL}""")
+
+    return JSONResponse({
+        "success": True,
+        "ticket_id": ticket_id,
+        "message": "Ticket created successfully"
+    })
+
+@app.get("/api/support/tickets/{phone}")
+async def get_user_tickets(phone: str):
+    """Get all tickets for a user"""
+    tickets = support_tickets.get(phone, [])
+    return JSONResponse({
+        "phone": phone,
+        "total": len(tickets),
+        "tickets": tickets
+    })
+
+@app.get("/api/support/all")
+async def get_all_tickets(request: Request):
+    """Admin — get all support tickets"""
+    secret = request.headers.get("x-admin-secret", "")
+    if secret != ADMIN_SECRET:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    all_tickets = []
+    for phone, tickets in support_tickets.items():
+        for t in tickets:
+            all_tickets.append({**t, "user_phone": phone})
+
+    # Sort by date newest first
+    all_tickets.sort(key=lambda x: x.get("created", ""), reverse=True)
+
+    open_count     = len([t for t in all_tickets if t["status"] == "open"])
+    resolved_count = len([t for t in all_tickets if t["status"] == "resolved"])
+
+    return JSONResponse({
+        "total": len(all_tickets),
+        "open": open_count,
+        "resolved": resolved_count,
+        "tickets": all_tickets
+    })
+
+@app.post("/api/support/reply")
+async def reply_to_ticket(request: Request):
+    """Admin replies to a support ticket"""
+    body = await request.json()
+    secret = body.get("secret", "")
+    if secret != ADMIN_SECRET:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    ticket_id = body.get("ticket_id", "")
+    reply_msg = body.get("reply", "")
+    resolve   = body.get("resolve", False)
+
+    # Find ticket
+    for phone, tickets in support_tickets.items():
+        for ticket in tickets:
+            if ticket["id"] == ticket_id:
+                ticket["replies"].append({
+                    "message": reply_msg,
+                    "from": "admin",
+                    "timestamp": datetime.datetime.now().isoformat()
+                })
+                if resolve:
+                    ticket["status"]   = "resolved"
+                    ticket["resolved"] = True
+                save_data()
+
+                # Notify user via WhatsApp
+                send_whatsapp_message(phone,
+                    f"""📬 *Support Reply — {COMPANY_NAME}*
+━━━━━━━━━━━━━━━━━━━━━━
+🎫 Ticket: *{ticket_id}*
+📋 Subject: {ticket.get('subject','')}
+
+💬 *Response:*
+{reply_msg}
+
+Status: {'✅ Resolved' if resolve else '🔄 In Progress'}
+
+Reply here or call: {SUPPORT_PHONE}""")
+
+                return JSONResponse({"success": True, "ticket_id": ticket_id})
+
+    return JSONResponse({"error": "Ticket not found"}, status_code=404)
+
+@app.post("/api/support/admin-fix")
+async def admin_fix_account(request: Request):
+    """Admin fixes user account issues"""
+    body = await request.json()
+    secret = body.get("secret", "")
+    if secret != ADMIN_SECRET:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    phone  = body.get("phone", "")
+    action = body.get("action", "")
+    note   = body.get("note", "")
+
+    result = {"success": False, "action": action, "phone": phone}
+
+    if action == "reset_trial":
+        if phone in farmer_profiles:
+            farmer_profiles[phone]["joined"] = datetime.datetime.now().isoformat()
+            save_data()
+            result["success"] = True
+            result["message"] = f"Trial reset for {phone}"
+            send_whatsapp_message(phone,
+                f"🎁 *Trial Reset by {COMPANY_NAME}*\nYour 30-day free trial has been reset!\nAll premium features unlocked again.\nType *MENU* to continue! 🌱")
+
+    elif action == "extend_premium":
+        days = body.get("days", 30)
+        if phone in premium_users:
+            current_exp = premium_users[phone].get("expires", datetime.datetime.now().isoformat())
+            try:
+                exp_dt = datetime.datetime.fromisoformat(current_exp)
+            except:
+                exp_dt = datetime.datetime.now()
+            new_exp = exp_dt + datetime.timedelta(days=days)
+            premium_users[phone]["expires"] = new_exp.isoformat()
+            premium_users[phone]["active"]  = True
+        else:
+            premium_users[phone] = {
+                "active": True, "plan": "premium",
+                "activated": datetime.datetime.now().isoformat(),
+                "expires": (datetime.datetime.now() + datetime.timedelta(days=days)).isoformat()
+            }
+        save_data()
+        result["success"] = True
+        result["message"] = f"Premium extended {days} days for {phone}"
+        send_whatsapp_message(phone,
+            f"✅ *Account Updated — {COMPANY_NAME}*\nYour premium has been extended by {days} days!\nType *MENU* to continue! 🌱")
+
+    elif action == "clear_history":
+        if phone in conversations:
+            conversations[phone] = []
+            save_data()
+        result["success"] = True
+        result["message"] = f"History cleared for {phone}"
+
+    elif action == "refund_reset":
+        if phone in premium_users:
+            premium_users[phone]["active"] = False
+            save_data()
+        result["success"] = True
+        result["message"] = f"Premium deactivated for {phone}"
+        send_whatsapp_message(phone,
+            f"ℹ️ *Account Update — {COMPANY_NAME}*\n{note or 'Your account has been updated.'}\nContact: {SUPPORT_PHONE}")
+
+    elif action == "send_message":
+        send_whatsapp_message(phone, note)
+        result["success"] = True
+        result["message"] = f"Message sent to {phone}"
+
+    return JSONResponse(result)
+
+# ══════════════════════════════════════════════════════════════
+# ── NOTIFICATIONS & UPDATES SYSTEM ────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+@app.post("/api/notifications/send")
+async def send_notification(request: Request):
+    """Admin sends notification to all or specific users"""
+    body = await request.json()
+    secret = body.get("secret", "")
+    if secret != ADMIN_SECRET:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    title      = body.get("title", "")
+    message    = body.get("message", "")
+    notify_type = body.get("type", "update")
+    target     = body.get("target", "all")  # all / premium / trial / specific
+    target_phone = body.get("phone", "")
+
+    notif = {
+        "id": secrets.token_hex(8),
+        "title": title,
+        "message": message,
+        "type": notify_type,
+        "target": target,
+        "created": datetime.datetime.now().isoformat(),
+        "read_by": []
+    }
+    notifications.append(notif)
+    save_data()
+
+    # Send WhatsApp to targeted users
+    sent_count = 0
+    targets = []
+
+    if target == "all":
+        targets = list(farmer_profiles.keys())
+    elif target == "premium":
+        targets = [p for p in premium_users if premium_users[p].get("active")]
+    elif target == "trial":
+        targets = [p for p in farmer_profiles if is_in_trial(p)]
+    elif target == "specific" and target_phone:
+        targets = [target_phone]
+
+    whatsapp_msg = f"""📢 *{title}*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+{message}
+━━━━━━━━━━━━━━━━━━━━━━
+Type *MENU* to continue 🌱"""
+
+    for phone in targets[:50]:  # Limit to 50 per call
+        try:
+            send_whatsapp_message(phone, whatsapp_msg)
+            sent_count += 1
+        except:
+            pass
+
+    return JSONResponse({
+        "success": True,
+        "notification_id": notif["id"],
+        "sent_to": sent_count
+    })
+
+@app.get("/api/notifications")
+async def get_notifications(phone: str = ""):
+    """Get notifications for a user"""
+    user_notifs = []
+    plan = get_plan(phone) if phone else "free"
+
+    for n in notifications[-20:]:
+        target = n.get("target", "all")
+        # Check if this notification is for this user
+        if (target == "all" or
+            (target == "premium" and plan in ["premium","business"]) or
+            (target == "trial"   and plan == "trial") or
+            (target == "specific" and n.get("phone") == phone)):
+            user_notifs.append({
+                **n,
+                "read": phone in n.get("read_by", [])
+            })
+
+    return JSONResponse({
+        "total": len(user_notifs),
+        "unread": len([n for n in user_notifs if not n.get("read")]),
+        "notifications": list(reversed(user_notifs))
+    })
+
+@app.post("/api/notifications/read")
+async def mark_notification_read(request: Request):
+    """Mark notification as read"""
+    body = await request.json()
+    phone   = body.get("phone", "")
+    notif_id = body.get("notification_id", "")
+    for n in notifications:
+        if n["id"] == notif_id and phone not in n.get("read_by", []):
+            n.setdefault("read_by", []).append(phone)
+    save_data()
+    return JSONResponse({"success": True})
+
+# ══════════════════════════════════════════════════════════════
+# ── ECOCASH AUTO PAYMENT VERIFICATION ─────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+@app.post("/api/payment/ecocash-webhook")
+async def ecocash_webhook(request: Request):
+    """
+    EcoCash payment gateway webhook
+    Called automatically when payment is received
+    """
+    try:
+        body = await request.json()
+        print(f"EcoCash webhook received: {body}")
+
+        # Extract payment details from EcoCash callback
+        # EcoCash sends: transactionId, amount, msisdn (phone), reference, status
+        transaction_id = body.get("transactionId") or body.get("transaction_id", "")
+        amount         = str(body.get("amount", ""))
+        payer_phone    = body.get("msisdn") or body.get("phone", "")
+        reference      = body.get("reference") or body.get("clientCorrelator", "")
+        status         = body.get("transactionOperationStatus") or body.get("status", "")
+
+        print(f"Payment: {payer_phone} | Ref: {reference} | Status: {status} | Amount: ${amount}")
+
+        # Check if payment is successful
+        success_statuses = ["COMPLETED", "SUCCESS", "SUCCESSFUL", "completed", "success"]
+        if status not in success_statuses:
+            return JSONResponse({"status": "pending", "message": f"Payment status: {status}"})
+
+        # Find matching pending payment by reference
+        matched_phone = None
+        matched_plan  = None
+
+        # Check by reference code
+        for ref_key, pending in payment_pending.items():
+            if (reference and ref_key.upper() == reference.upper()) or \
+               (payer_phone and pending.get("phone", "").endswith(payer_phone[-9:])):
+                matched_phone = pending["phone"]
+                matched_plan  = pending.get("plan", "premium")
+                break
+
+        # Also try matching by phone number directly
+        if not matched_phone and payer_phone:
+            # Try to find farmer by phone
+            clean_payer = payer_phone.replace("+", "").replace(" ", "")
+            for phone in farmer_profiles:
+                clean_farmer = phone.replace("+", "").replace(" ", "")
+                if clean_payer.endswith(clean_farmer[-9:]) or clean_farmer.endswith(clean_payer[-9:]):
+                    matched_phone = phone
+                    # Determine plan by amount
+                    matched_plan = "business" if float(amount or 0) >= 10 else "premium"
+                    break
+
+        if not matched_phone:
+            print(f"No matching farmer found for payment: {payer_phone} ref: {reference}")
+            return JSONResponse({
+                "status": "unmatched",
+                "message": "Payment received but no matching farmer found"
+            })
+
+        # Activate premium
+        expires = (datetime.datetime.now() + datetime.timedelta(days=30)).isoformat()
+        premium_users[matched_phone] = {
+            "active": True,
+            "plan": matched_plan,
+            "amount": amount,
+            "activated": datetime.datetime.now().isoformat(),
+            "expires": expires,
+            "transaction_id": transaction_id,
+            "payment_method": "ecocash",
+            "auto_verified": True
+        }
+
+        # Update pending status
+        for ref_key in list(payment_pending.keys()):
+            if payment_pending[ref_key].get("phone") == matched_phone:
+                payment_pending[ref_key]["status"] = "confirmed"
+                payment_pending[ref_key]["transaction_id"] = transaction_id
+
+        # Update user account
+        if matched_phone in user_accounts:
+            user_accounts[matched_phone]["premium"] = True
+            user_accounts[matched_phone]["plan"]    = matched_plan
+
+        save_data()
+        print(f"✅ Premium auto-activated for {matched_phone}")
+
+        # Send WhatsApp confirmation instantly
+        send_whatsapp_message(matched_phone,
+            f"""🎉 *PAYMENT CONFIRMED AUTOMATICALLY!*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+✅ Amount: *${amount} USD*
+✅ Plan: *{matched_plan.upper()}*
+✅ Transaction: {transaction_id}
+✅ Status: *ACTIVE*
+✅ Valid: 30 days
+
+ALL PREMIUM FEATURES NOW ACTIVE:
+✅ GPS Weather Forecasts
+✅ Photo Crop Analysis
+✅ Live Market Prices
+✅ Seed Recommendations
+✅ Find Help Near You
+✅ Loan & Insurance Advice
+✅ Farm Planning Calendar
+
+Active on: WhatsApp + Website + App
+Type *MENU* to explore! 🌱🇿🇼""")
+
+        return JSONResponse({
+            "status": "success",
+            "message": "Payment verified and premium activated",
+            "phone": matched_phone,
+            "plan": matched_plan
+        })
+
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+@app.post("/api/payment/verify-manual")
+async def verify_payment_manual(request: Request):
+    """
+    Manual payment verification — checks pending payments
+    and activates if reference matches
+    """
+    body = await request.json()
+    phone     = body.get("phone", "")
+    reference = body.get("reference", "")
+    amount    = body.get("amount", "")
+
+    if not phone or not reference:
+        return JSONResponse({"error": "Phone and reference required"}, status_code=400)
+
+    expected_ref = f"AGRO{phone[-6:]}"
+
+    if reference.upper() == expected_ref.upper():
+        # Activate immediately
+        pending    = payment_pending.get(reference.upper(), {})
+        plan       = pending.get("plan", "premium" if float(amount or 2) < 10 else "business")
+        pay_amount = pending.get("amount", amount or "2")
+        expires    = (datetime.datetime.now() + datetime.timedelta(days=30)).isoformat()
+
+        premium_users[phone] = {
+            "active": True, "plan": plan,
+            "amount": pay_amount,
+            "activated": datetime.datetime.now().isoformat(),
+            "expires": expires,
+            "payment_ref": reference,
+            "manual_verified": True
+        }
+
+        if reference.upper() in payment_pending:
+            payment_pending[reference.upper()]["status"] = "confirmed"
+
+        if phone in user_accounts:
+            user_accounts[phone]["premium"] = True
+            user_accounts[phone]["plan"]    = plan
+
+        save_data()
+
+        confirmation = process_payment(phone, reference)
+        send_whatsapp_message(phone, confirmation)
+
+        return JSONResponse({
+            "success": True, "plan": plan,
+            "expires": expires,
+            "message": "Premium activated successfully"
+        })
+
+    return JSONResponse({
+        "success": False,
+        "expected": expected_ref,
+        "message": "Reference does not match"
+    }, status_code=400)
+
+# ══════════════════════════════════════════════════════════════
+# ── PREMIUM EXPIRY AUTO-CHECK ──────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+def check_premium_expiries():
+    """
+    Background task — runs every hour
+    Checks for expired premiums and expired trials
+    Sends warnings and deactivates as needed
+    """
+    while True:
+        try:
+            now = datetime.datetime.now()
+
+            # Check premium expiries
+            for phone, data in list(premium_users.items()):
+                if not data.get("active"):
+                    continue
+
+                expires_str = data.get("expires", "")
+                if not expires_str:
+                    continue
+
+                try:
+                    expires = datetime.datetime.fromisoformat(expires_str)
+                    days_left = (expires - now).days
+
+                    # Warning 3 days before expiry
+                    if days_left == 3:
+                        send_whatsapp_message(phone,
+                            f"""⚠️ *Premium Expiring Soon!*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+Your {data.get('plan','premium').upper()} plan
+expires in *3 days* on:
+{expires.strftime('%d %B %Y')}
+
+To renew, pay ${data.get('amount','2')} to:
+EcoCash: *{ECOCASH_NUMBER}*
+Ref: *AGRO{phone[-6:]}*
+
+Then reply: *PAID AGRO{phone[-6:]}*
+Or call: {SUPPORT_PHONE}""")
+
+                    # Warning 1 day before
+                    elif days_left == 1:
+                        send_whatsapp_message(phone,
+                            f"""🚨 *Premium Expires TOMORROW!*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+Renew NOW to keep all features!
+
+Pay ${data.get('amount','2')} via EcoCash:
+Number: *{ECOCASH_NUMBER}*
+Ref: *AGRO{phone[-6:]}*
+
+Then reply: *PAID AGRO{phone[-6:]}*
+📞 {SUPPORT_PHONE}""")
+
+                    # Deactivate expired
+                    elif days_left < 0:
+                        premium_users[phone]["active"] = False
+                        save_data()
+                        send_whatsapp_message(phone,
+                            f"""😔 *Premium Plan Expired*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+Your premium plan has expired.
+
+You can still use FREE services:
+✅ Crop disease advice
+✅ Soil analysis
+✅ Marketplace
+✅ Farming news
+✅ Community chat
+
+To renew: Pay ${data.get('amount','2')} to
+EcoCash: *{ECOCASH_NUMBER}*
+Ref: *AGRO{phone[-6:]}*
+Then reply: *PAID AGRO{phone[-6:]}*
+
+📞 {SUPPORT_PHONE}""")
+
+                except Exception as e:
+                    print(f"Expiry check error {phone}: {e}")
+
+            # Check trial warnings
+            for phone, profile in list(farmer_profiles.items()):
+                if is_premium(phone):
+                    continue  # Skip premium users
+
+                days_left = get_trial_days_left(phone)
+
+                if days_left == 7:
+                    send_whatsapp_message(phone,
+                        f"""⏰ *Trial Ending in 7 Days!*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+Your 30-day free trial ends in
+*7 days!*
+
+Subscribe to keep all features:
+💎 Premium: $2/month
+🏆 Business: $10/month
+
+Pay via EcoCash to: *{ECOCASH_NUMBER}*
+Ref: *AGRO{phone[-6:]}*
+Type: *UPGRADE* on WhatsApp
+
+📞 {SUPPORT_PHONE}""")
+
+                elif days_left == 1:
+                    send_whatsapp_message(phone,
+                        f"""🚨 *Trial Ends TOMORROW!*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+Don't lose access to premium features!
+
+Subscribe NOW:
+💎 $2/month via EcoCash
+Number: *{ECOCASH_NUMBER}*
+Ref: *AGRO{phone[-6:]}*
+
+Reply: *PAID AGRO{phone[-6:]}*
+📞 {SUPPORT_PHONE}""")
+
+                elif days_left == 0:
+                    # Trial just expired today
+                    joined_str = profile.get("joined", "")
+                    try:
+                        joined   = datetime.datetime.fromisoformat(joined_str)
+                        trial_end = joined + datetime.timedelta(days=TRIAL_DAYS)
+                        hours_ago = (now - trial_end).total_seconds() / 3600
+                        if 0 < hours_ago < 2:  # Only send once
+                            send_whatsapp_message(phone,
+                                f"""😔 *Free Trial Has Ended*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+Your 30-day free trial is over.
+
+Free services still available:
+✅ Crop disease advice
+✅ Soil analysis
+✅ Marketplace & Community
+
+Subscribe for full access:
+💎 Premium: $2/month
+
+EcoCash: *{ECOCASH_NUMBER}*
+Ref: *AGRO{phone[-6:]}*
+Then reply: *PAID AGRO{phone[-6:]}*
+📞 {SUPPORT_PHONE}""")
+                    except:
+                        pass
+
+            save_data()
+
+        except Exception as e:
+            print(f"Background check error: {e}")
+
+        # Run every 1 hour
+        time.sleep(3600)
+
+# ── Start background expiry checker ───────────────────────────
+expiry_thread = threading.Thread(target=check_premium_expiries, daemon=True)
+expiry_thread.start()
+print("✅ Premium expiry checker started")
+
+# ── Admin Stats Enhanced ───────────────────────────────────────
+@app.get("/api/admin/dashboard")
+async def admin_dashboard(request: Request):
+    """Full admin dashboard data"""
+    secret = request.headers.get("x-admin-secret", "")
+    if secret != ADMIN_SECRET:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    now = datetime.datetime.now()
+    seven_days_ago = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+
+    # Count stats
+    all_tickets = []
+    for tickets in support_tickets.values():
+        all_tickets.extend(tickets)
+
+    expiring_soon = []
+    for phone, data in premium_users.items():
+        if data.get("active"):
+            try:
+                exp = datetime.datetime.fromisoformat(data.get("expires",""))
+                if (exp - now).days <= 7:
+                    expiring_soon.append({
+                        "phone": phone,
+                        "plan": data.get("plan"),
+                        "expires": data.get("expires"),
+                        "days_left": (exp - now).days
+                    })
+            except:
+                pass
+
+    # Revenue estimate
+    premium_count  = len([p for p in premium_users.values() if p.get("active") and p.get("plan")=="premium"])
+    business_count = len([p for p in premium_users.values() if p.get("active") and p.get("plan")=="business"])
+    monthly_revenue = (premium_count * 2) + (business_count * 10)
+
+    return JSONResponse({
+        "summary": {
+            "total_farmers": len(farmer_profiles),
+            "premium_active": premium_count,
+            "business_active": business_count,
+            "trial_active": sum(1 for p in farmer_profiles if is_in_trial(p)),
+            "expired_trial": sum(1 for p in farmer_profiles if not is_in_trial(p) and not is_premium(p)),
+            "monthly_revenue_usd": monthly_revenue,
+            "open_tickets": len([t for t in all_tickets if t.get("status")=="open"]),
+            "total_conversations": sum(len(c) for c in conversations.values()),
+            "community_posts": len(community_posts),
+            "marketplace_listings": len(marketplace) + len(buyer_requests)
+        },
+        "expiring_soon": expiring_soon,
+        "recent_payments": [
+            {**v, "phone": k}
+            for k, v in list(premium_users.items())[-10:]
+            if v.get("activated")
+        ],
+        "recent_tickets": all_tickets[:10],
+        "farmers_list": [
+            {
+                "phone": p,
+                "location": farmer_profiles[p].get("location",""),
+                "plan": get_plan(p),
+                "trial_days_left": get_trial_days_left(p),
+                "days_active": user_activity.get(p,{}).get("total_days_active",0),
+                "joined": farmer_profiles[p].get("joined","")[:10],
+                "messages": user_activity.get(p,{}).get("total_messages",0)
+            }
+            for p in farmer_profiles
+        ]
+    })
 # ── Health Check ───────────────────────────────────────────────
 @app.get("/")
 def home():
