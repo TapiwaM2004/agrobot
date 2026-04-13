@@ -3762,6 +3762,89 @@ async def admin_dashboard(request: Request):
             for p in farmer_profiles
         ]
     })
+# ── Admin Password Management ──────────────────────────────────
+admin_config = {}
+
+def load_admin_config():
+    global admin_config
+    try:
+        with open("admin_config.json", "r") as f:
+            admin_config.update(json.load(f))
+    except:
+        admin_config = {
+            "password": "AGROBOT_ADMIN_2026",
+            "last_changed": datetime.datetime.now().isoformat()
+        }
+
+def save_admin_config():
+    with open("admin_config.json", "w") as f:
+        json.dump(admin_config, f, indent=2)
+
+load_admin_config()
+
+@app.post("/api/admin/change-password")
+async def change_admin_password(request: Request):
+    body = await request.json()
+    current  = body.get("current_password", "")
+    new_pass = body.get("new_password", "")
+    confirm  = body.get("confirm_password", "")
+
+    # Verify current password
+    stored = admin_config.get("password", ADMIN_SECRET)
+    if current != stored and current != ADMIN_SECRET:
+        return JSONResponse({
+            "success": False,
+            "error": "Current password is incorrect"
+        }, status_code=401)
+
+    # Validate new password
+    if not new_pass or len(new_pass) < 8:
+        return JSONResponse({
+            "success": False,
+            "error": "New password must be at least 8 characters"
+        }, status_code=400)
+
+    if new_pass != confirm:
+        return JSONResponse({
+            "success": False,
+            "error": "New passwords do not match"
+        }, status_code=400)
+
+    if new_pass == current:
+        return JSONResponse({
+            "success": False,
+            "error": "New password must be different from current"
+        }, status_code=400)
+
+    # Save new password
+    admin_config["password"]     = new_pass
+    admin_config["last_changed"] = datetime.datetime.now().isoformat()
+    save_admin_config()
+
+    print(f"Admin password changed at {datetime.datetime.now()}")
+
+    return JSONResponse({
+        "success": True,
+        "message": "Password changed successfully",
+        "last_changed": admin_config["last_changed"]
+    })
+
+@app.post("/api/admin/verify-password")
+async def verify_admin_password(request: Request):
+    """Check if admin password is correct"""
+    body = await request.json()
+    password = body.get("password", "")
+    stored   = admin_config.get("password", ADMIN_SECRET)
+
+    if password == stored or password == ADMIN_SECRET:
+        return JSONResponse({
+            "success": True,
+            "last_changed": admin_config.get("last_changed", "Unknown")
+        })
+    return JSONResponse({
+        "success": False,
+        "error": "Incorrect password"
+    }, status_code=401)
 # ── Health Check ───────────────────────────────────────────────
 @app.get("/")
 def home():
