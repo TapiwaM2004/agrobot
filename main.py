@@ -1265,74 +1265,101 @@ def get_farmer_context(phone: str) -> str:
 # ── AI ─────────────────────────────────────────────────────────
 def ask_groq(question: str, topic: str = "", phone: str = "") -> str:
     try:
-        ctx = get_farmer_context(phone) if phone else ""
-        system_prompt = f"""You are {BOT_NAME} — Zimbabwe's premier AI agriculture consultant by {COMPANY_NAME}.
-CONTEXT: {ctx}
-{f'Focus: {topic}' if topic else ''}
+        profile = farmer_profiles.get(phone, {})
+        now = datetime.datetime.now()
 
-STANDARDS:
-- Expert, professional agricultural advice
-- Reference Zimbabwe products: ZFC fertilizers, Seedco/Pannar/ARDA seeds, Agricura chemicals
-- Include scientific names, specific rates (kg/ha, L/ha), costs in USD
-- Reference Agritex guidelines and GMB prices
-- Consider Zimbabwe climate change impacts
-- Specific and actionable — end with ONE deadline-based tip
-- Under 200 words but comprehensive"""
+        # Build precise location context
+        location_context = ""
+        gps_used = False
+
+        if "gps_lat" in profile:
+            lat = profile["gps_lat"]
+            lon = profile["gps_lon"]
+            nearest = find_nearest_region(lat, lon)
+            info = nearest["info"]
+            gps_used = True
+            location_context = f"""
+FARMER EXACT GPS LOCATION:
+Coordinates: {lat:.6f}°S, {lon:.6f}°E
+Nearest Town: {nearest['name'].title()}
+Climate Region: Region {info['region']} — {info['climate']}
+Annual Rainfall: {info['rainfall']}
+Soil Type: {info.get('soil', 'Mixed soils')}
+Best Crops for THIS exact area: {info['best_crops']}
+Planting Season: {info.get('season', 'November-April')}
+Local Challenges: {info.get('challenges', 'Variable rainfall')}
+NOTE: This advice is specifically for GPS coordinates {lat:.4f}, {lon:.4f}
+NOT generic Zimbabwe advice — this is for their exact farm location."""
+
+        elif "location" in profile:
+            loc = profile["location"]
+            info = get_region_info(loc)
+            location_context = f"""
+FARMER SPECIFIC LOCATION: {loc.title()}
+Climate Region: Region {info['region']} — {info['climate']}
+Annual Rainfall: {info['rainfall']}
+Soil Type: {info.get('soil', 'Mixed soils')}
+Best Crops for {loc.title()}: {info['best_crops']}
+Planting Season: {info.get('season', 'November-April')}
+Local Challenges: {info.get('challenges', 'Variable rainfall')}
+NOTE: Give advice specific to {loc.title()}, NOT general Zimbabwe advice."""
+
+        else:
+            location_context = """
+FARMER LOCATION: Not set — give general Zimbabwe advice
+but remind them to set their location for specific advice."""
+
+        system_prompt = f"""You are {BOT_NAME} — Zimbabwe's most advanced AI agriculture consultant by {COMPANY_NAME}.
+
+TODAY'S DATE: {now.strftime('%d %B %Y')}
+CURRENT SEASON: {
+    'Late season — harvest preparation, soil conservation' 
+    if now.month in [3, 4] else
+    'Post-harvest — land preparation, planning' 
+    if now.month in [5, 6, 7] else
+    'Pre-season — input procurement, land prep' 
+    if now.month in [8, 9, 10] else
+    'Planting season — crop establishment critical'
+}
+
+{location_context}
+
+SUBSCRIPTION: {get_plan(phone).upper()}
+
+RESPONSE REQUIREMENTS — VERY IMPORTANT:
+1. Give SPECIFIC advice for {profile.get('location', 'Zimbabwe').title() if not gps_used else f'GPS location {profile.get("gps_lat", 0):.4f}, {profile.get("gps_lon", 0):.4f}'}
+2. NEVER give generic country-wide advice when location is known
+3. Reference specific local conditions, soil, rainfall for their area
+4. Include SPECIFIC product names available in Zimbabwe:
+   - Fertilizers: ZFC Compound D/L/S, ZFC AN, Windmill products
+   - Seeds: Seedco SC403/SC513/SC633, Pannar PAN 53/67, ARDA varieties
+   - Chemicals: Agricura, Condor, Syngenta products available locally
+5. Include specific QUANTITIES and RATES (kg/ha, litres/ha, bags/acre)
+6. Include realistic COSTS in USD based on current Zimbabwe market
+7. Give TIMING specific to their current season
+8. Minimum 150 words — maximum 300 words
+9. Structure response with clear sections
+10. End with ONE urgent specific action with exact deadline
+
+{f'FOCUS TOPIC: {topic}' if topic else ''}
+
+Remember: A farmer in {profile.get("location", "Zimbabwe").title()} 
+needs advice for THEIR specific microclimate and conditions,
+not advice that could apply anywhere in Zimbabwe."""
 
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question}
-            ]
+            ],
+            max_tokens=600
         )
         return response.choices[0].message.content
+
     except Exception as e:
         print(f"Groq error: {e}")
         return f"AgroBot temporarily unavailable. Please try again.\n📞 {SUPPORT_PHONE}"
-
-def get_farming_news(phone: str = "") -> str:
-    try:
-        profile = farmer_profiles.get(phone, {})
-        location = profile.get("location", "Zimbabwe")
-        info = get_region_info(location)
-        now = datetime.datetime.now()
-
-        prompt = f"""You are {BOT_NAME} News — Zimbabwe agricultural news by {COMPANY_NAME}.
-Location: {location.title()}, Region {info['region']} ({info['climate']})
-Date: {now.strftime('%d %B %Y')}
-
-Generate PROFESSIONAL farming news bulletin:
-
-📰 TOP STORY — Critical Zimbabwe farming development
-🌦️ CLIMATE ALERT — Weather pattern + specific action
-💰 MARKET WATCH — Commodity price movements
-🌱 CROP ADVISORY FOR {location.upper()} — Actions THIS WEEK
-🔬 AGRI-INNOVATION — Latest tech for Zimbabwe
-⚠️ PEST ALERT — Current threats (armyworm, etc.)
-📋 POLICY UPDATE — Agritex/GMB/government news
-💡 TIP OF THE WEEK — One high-value practical tip
-
-2-3 sentences per section. Specific and actionable."""
-
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        return f"""📰 *{BOT_NAME.upper()} FARMING NEWS*
-{COMPANY_NAME}
-📅 {now.strftime('%d %B %Y')} | {location.title()}
-━━━━━━━━━━━━━━━━━━━━━━
-
-{response.choices[0].message.content}
-
-━━━━━━━━━━━━━━━━━━━━━━
-📞 {SUPPORT_PHONE} | 🌐 {WEBSITE}
-Type *MENU* to return"""
-    except Exception as e:
-        return "Could not generate news. Please try again."
-
 def get_weather(lat: float, lon: float, name: str = "Your Farm") -> str:
     try:
         url = (f"https://api.open-meteo.com/v1/forecast?"
@@ -3845,6 +3872,574 @@ async def verify_admin_password(request: Request):
         "success": False,
         "error": "Incorrect password"
     }, status_code=401)
+@app.post("/api/verify-location")
+async def verify_location(request: Request):
+    """Farmer submits location name for verification and profile update"""
+    body = await request.json()
+    phone    = body.get("phone", "")
+    location = body.get("location", "").lower().strip()
+
+    if not phone or not location:
+        return JSONResponse({"error": "Phone and location required"}, status_code=400)
+
+    # Find matching region
+    matched_city = None
+    matched_info = None
+
+    for city, info in ZIMBABWE_REGIONS.items():
+        if city in location or location in city:
+            matched_city = city
+            matched_info = info
+            break
+
+    if not matched_city:
+        # Use AI to identify the location
+        try:
+            prompt = f"""The Zimbabwe farmer says their location is: "{location}"
+Match this to the nearest known Zimbabwe town or district.
+Return ONLY a JSON object like:
+{{"city": "harare", "confidence": "high", "note": "Matched to Harare metropolitan area"}}
+Choose from: harare, bulawayo, mutare, masvingo, gweru, marondera, chinhoyi, bindura, victoria falls, kariba, chiredzi, beitbridge, zvishavane, kwekwe, kadoma, norton, rusape, nyanga, chipinge"""
+
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100
+            )
+            raw = response.choices[0].message.content.strip()
+            if "```" in raw:
+                raw = raw.split("```")[1].split("```")[0].replace("json","").strip()
+            result = json.loads(raw)
+            matched_city = result.get("city", "harare")
+            matched_info = ZIMBABWE_REGIONS.get(matched_city, ZIMBABWE_REGIONS["harare"])
+            ai_note = result.get("note", "")
+        except:
+            matched_city = "harare"
+            matched_info = ZIMBABWE_REGIONS["harare"]
+            ai_note = "Could not verify — defaulted to Harare"
+    else:
+        ai_note = f"Matched to {matched_city.title()}"
+
+    # Update farmer profile
+    if phone not in farmer_profiles:
+        farmer_profiles[phone] = {"joined": datetime.datetime.now().isoformat()}
+
+    farmer_profiles[phone]["location"] = matched_city
+    farmer_profiles[phone]["location_input"] = location
+    farmer_profiles[phone]["location_verified"] = True
+    save_data()
+
+    return JSONResponse({
+        "success": True,
+        "input": location,
+        "matched_city": matched_city,
+        "note": ai_note,
+        "region_info": matched_info,
+        "message": f"Location verified as {matched_city.title()}"
+    })
+# ── EcoCash Transaction Monitor ────────────────────────────────
+@app.post("/api/payment/ecocash-notify")
+async def ecocash_notify(request: Request):
+    """
+    EcoCash sends notification when ANY payment arrives
+    to the admin number — no reference needed.
+    System matches by phone number automatically.
+    """
+    try:
+        body = await request.json()
+        print(f"EcoCash notification: {body}")
+
+        # EcoCash notification fields
+        payer_phone    = (body.get("msisdn") or
+                         body.get("senderMsisdn") or
+                         body.get("phone") or
+                         body.get("payer", "")).replace("+","").replace(" ","")
+
+        amount_str     = str(body.get("amount") or
+                            body.get("transactionAmount") or
+                            body.get("value") or "0")
+        try:
+            amount = float(amount_str)
+        except:
+            amount = 0.0
+
+        transaction_id = (body.get("transactionId") or
+                         body.get("id") or
+                         body.get("ftid") or
+                         secrets.token_hex(8))
+
+        status         = (body.get("transactionOperationStatus") or
+                         body.get("status") or "COMPLETED").upper()
+
+        if status not in ["COMPLETED","SUCCESS","SUCCESSFUL"]:
+            return JSONResponse({"status": "pending"})
+
+        if amount < 1.5:
+            return JSONResponse({
+                "status": "ignored",
+                "reason": f"Amount ${amount} too low to be subscription"
+            })
+
+        # Determine plan from amount
+        if amount >= 9.0:
+            plan = "business"
+        else:
+            plan = "premium"
+
+        # Find farmer by phone number
+        matched_phone = None
+
+        # Clean payer phone for matching
+        clean_payer = payer_phone.replace("+","").replace(" ","").replace("-","")
+
+        # Try to match farmer
+        for farmer_phone in farmer_profiles:
+            clean_farmer = farmer_phone.replace("+","").replace(" ","").replace("-","")
+            # Match last 9 digits
+            if (clean_payer[-9:] == clean_farmer[-9:] or
+                clean_payer[-8:] == clean_farmer[-8:]):
+                matched_phone = farmer_phone
+                break
+
+        if not matched_phone:
+            # Check user accounts
+            for acc_phone in user_accounts:
+                clean_acc = acc_phone.replace("+","").replace(" ","").replace("-","")
+                if (clean_payer[-9:] == clean_acc[-9:] or
+                    clean_payer[-8:] == clean_acc[-8:]):
+                    matched_phone = acc_phone
+                    break
+
+        if not matched_phone:
+            # Create record for manual review
+            unmatched_key = f"unmatched_{transaction_id}"
+            payment_pending[unmatched_key] = {
+                "payer_phone": payer_phone,
+                "amount": amount,
+                "plan": plan,
+                "transaction_id": transaction_id,
+                "status": "unmatched",
+                "received": datetime.datetime.now().isoformat()
+            }
+            save_data()
+            print(f"Unmatched payment: {payer_phone} ${amount}")
+            return JSONResponse({
+                "status": "unmatched",
+                "message": f"Payment ${amount} from {payer_phone} received but no matching farmer found",
+                "transaction_id": transaction_id
+            })
+
+        # Activate premium for matched farmer
+        expires = (datetime.datetime.now() + datetime.timedelta(days=30)).isoformat()
+
+        premium_users[matched_phone] = {
+            "active":         True,
+            "plan":           plan,
+            "amount":         str(amount),
+            "activated":      datetime.datetime.now().isoformat(),
+            "expires":        expires,
+            "transaction_id": transaction_id,
+            "payer_phone":    payer_phone,
+            "payment_method": "ecocash_auto",
+            "no_reference":   True
+        }
+
+        if matched_phone in user_accounts:
+            user_accounts[matched_phone]["premium"] = True
+            user_accounts[matched_phone]["plan"]    = plan
+
+        save_data()
+        print(f"✅ Auto-activated {plan} for {matched_phone} — ${amount} from {payer_phone}")
+
+        # Instant WhatsApp confirmation
+        send_whatsapp_message(matched_phone,
+            f"""🎉 *PAYMENT RECEIVED — PREMIUM ACTIVATED!*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+✅ Amount: *${amount:.2f} USD* received!
+✅ Plan: *{plan.upper()}*
+✅ Transaction: {transaction_id}
+✅ Status: *ACTIVE NOW*
+✅ Valid: 30 days
+
+*ALL PREMIUM FEATURES UNLOCKED:*
+✅ GPS Precision Weather
+✅ Photo Crop Disease Analysis
+✅ Live Market Prices
+✅ Seed Brand Recommendations
+✅ Find Help Near You
+✅ Loan & Insurance Advisory
+✅ Farm Planning Calendar
+
+Active on: WhatsApp + Website + App 🌐
+Type *MENU* to use all features! 🌱🇿🇼
+
+Thank you for supporting {COMPANY_NAME}!""")
+
+        return JSONResponse({
+            "status":         "success",
+            "phone":          matched_phone,
+            "plan":           plan,
+            "amount":         amount,
+            "transaction_id": transaction_id,
+            "message":        "Premium activated automatically"
+        })
+
+    except Exception as e:
+        print(f"EcoCash notify error: {e}")
+        return JSONResponse({
+            "status": "error",
+            "message": str(e)
+        }, status_code=500)
+
+@app.get("/api/payment/unmatched")
+async def get_unmatched_payments(request: Request):
+    """Admin — view payments that couldn't be matched to a farmer"""
+    secret = request.headers.get("x-admin-secret","")
+    if secret != ADMIN_SECRET:
+        return JSONResponse({"error":"Unauthorized"}, status_code=401)
+
+    unmatched = [
+        {**v, "ref": k}
+        for k, v in payment_pending.items()
+        if v.get("status") == "unmatched"
+    ]
+    return JSONResponse({
+        "total": len(unmatched),
+        "unmatched": unmatched
+    })
+
+@app.post("/api/payment/match-manual")
+async def match_unmatched_payment(request: Request):
+    """Admin manually matches an unmatched payment to a farmer"""
+    body   = await request.json()
+    secret = body.get("secret","")
+    if secret != ADMIN_SECRET:
+        return JSONResponse({"error":"Unauthorized"}, status_code=401)
+
+    ref    = body.get("ref","")
+    phone  = body.get("phone","")
+
+    if ref not in payment_pending:
+        return JSONResponse({"error":"Payment not found"}, status_code=404)
+
+    pending = payment_pending[ref]
+    amount  = float(pending.get("amount", 2))
+    plan    = "business" if amount >= 9 else "premium"
+
+    premium_users[phone] = {
+        "active":         True,
+        "plan":           plan,
+        "amount":         str(amount),
+        "activated":      datetime.datetime.now().isoformat(),
+        "expires":        (datetime.datetime.now() + datetime.timedelta(days=30)).isoformat(),
+        "transaction_id": pending.get("transaction_id",""),
+        "manually_matched": True
+    }
+
+    payment_pending[ref]["status"]       = "matched"
+    payment_pending[ref]["matched_phone"] = phone
+    save_data()
+
+    send_whatsapp_message(phone,
+        f"🎉 *Payment Matched & Premium Activated!*\n{COMPANY_NAME}\n\n"
+        f"✅ ${amount} payment confirmed!\n"
+        f"✅ {plan.upper()} plan is now ACTIVE!\n\n"
+        f"Type *MENU* to explore all features! 🌱")
+
+    return JSONResponse({
+        "success": True,
+        "phone":   phone,
+        "plan":    plan
+    })
+@app.post("/api/analyse-image-web")
+async def analyse_image_web(request: Request):
+    """Direct image analysis from website — no WhatsApp needed"""
+    try:
+        body = await request.json()
+        img_base64       = body.get("image_base64", "")
+        img_type         = body.get("image_type", "image/jpeg")
+        phone            = body.get("phone", "")
+        location_context = body.get("location_context", "")
+
+        if not img_base64:
+            return JSONResponse({"error": "No image provided"}, status_code=400)
+
+        farmer_ctx = get_farmer_context(phone) if phone else ""
+
+        models = [
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "meta-llama/llama-4-maverick-17b-128e-instruct",
+        ]
+
+        prompt = f"""You are {BOT_NAME} — expert plant pathologist for Zimbabwe agriculture.
+
+{farmer_ctx}
+{location_context}
+
+Analyse this crop image carefully and provide a COMPLETE professional report:
+
+🌿 CROP IDENTIFIED:
+(Common name + scientific name + growth stage)
+
+🔍 PROBLEM DETECTED:
+(Disease/pest/deficiency/environmental — be specific)
+
+🧬 CAUSE:
+(Pathogen species OR pest species OR nutrient)
+
+📊 SEVERITY: Low / Moderate / High / Critical
+(Estimate % of plant affected)
+
+💊 IMMEDIATE TREATMENT:
+Product: [Zimbabwe brand name — Agricura/ZFC/Syngenta/Condor]
+Rate: [exact rate in ml/L or kg/ha]
+Method: [spray/drench/dust]
+When: [apply within X days]
+
+🔄 FOLLOW-UP TREATMENT:
+(If needed — 7-14 days later)
+
+🛡️ PREVENTION NEXT SEASON:
+(2-3 specific steps)
+
+⏰ URGENCY: Act within [X hours/days]
+
+💰 ESTIMATED COST: $[X] USD for treatment
+
+If image quality is poor or unclear, state honestly what
+you CAN see and what additional photos would help.
+Do NOT guess blindly — say what confidence level you have."""
+
+        last_error = ""
+        for model in models:
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{
+                        "role":"user",
+                        "content":[
+                            {
+                                "type":"image_url",
+                                "image_url":{
+                                    "url":f"data:{img_type};base64,{img_base64}"
+                                }
+                            },
+                            {"type":"text","text":prompt}
+                        ]
+                    }],
+                    max_tokens=800
+                )
+
+                analysis = response.choices[0].message.content
+
+                # Check if model actually analysed it
+                fail_phrases = [
+                    "cannot see","can't see","no image",
+                    "not provided","unable to view","i don't see",
+                    "no photo","image not"
+                ]
+                if any(p in analysis.lower() for p in fail_phrases):
+                    last_error = "Vision model could not process image"
+                    continue
+
+                # Save to conversation
+                if phone:
+                    save_conversation(phone, "farmer",
+                        "[Uploaded crop photo via website]", "image")
+                    save_conversation(phone, "agrobot", analysis, "image_analysis")
+
+                return JSONResponse({
+                    "success":  True,
+                    "analysis": analysis,
+                    "model":    model
+                })
+
+            except Exception as model_err:
+                last_error = str(model_err)
+                print(f"Model {model} failed: {model_err}")
+                continue
+
+        return JSONResponse({
+            "error": "Could not analyse image. Please try a clearer photo or describe symptoms.",
+            "detail": last_error
+        }, status_code=500)
+
+    except Exception as e:
+        print(f"Web image analysis error: {e}")
+        return JSONResponse({
+            "error": "Analysis failed. Please try again."
+        }, status_code=500)
+@app.post("/api/payment/initiate-ussd")
+async def initiate_ussd_payment(request: Request):
+    """
+    Initiate EcoCash USSD push payment from app
+    Sends payment request directly to farmer's phone
+    """
+    body        = await request.json()
+    phone       = body.get("phone", "")
+    payer_phone = body.get("payer_phone", "")
+    plan        = body.get("plan", "premium")
+    amount      = body.get("amount", 2)
+    method      = body.get("method", "ecocash")
+    farmer_name = body.get("farmer_name", "Farmer")
+
+    if not payer_phone:
+        return JSONResponse({
+            "success": False,
+            "message": "Phone number required"
+        }, status_code=400)
+
+    # Clean phone number
+    clean_phone = payer_phone.replace("+","").replace(" ","").replace("-","")
+    if not clean_phone.startswith("263"):
+        if clean_phone.startswith("0"):
+            clean_phone = "263" + clean_phone[1:]
+        else:
+            clean_phone = "263" + clean_phone
+
+    ref = generate_ref(phone)
+
+    # Store pending payment
+    payment_pending[ref] = {
+        "phone":        phone,
+        "payer_phone":  clean_phone,
+        "plan":         plan,
+        "amount":       str(amount),
+        "method":       method,
+        "initiated":    datetime.datetime.now().isoformat(),
+        "status":       "pending",
+        "ussd_push":    True
+    }
+    save_data()
+
+    try:
+        # ── ECOCASH USSD PUSH ──────────────────────────────
+        # EcoCash Merchant API endpoint
+        # Replace with your actual EcoCash merchant credentials
+        ECOCASH_MERCHANT_CODE = os.getenv("ECOCASH_MERCHANT_CODE", "")
+        ECOCASH_MERCHANT_PIN  = os.getenv("ECOCASH_MERCHANT_PIN", "")
+        ECOCASH_API_URL       = os.getenv("ECOCASH_API_URL",
+            "https://www.ecocash.co.zw/api/payment")
+
+        if ECOCASH_MERCHANT_CODE and ECOCASH_MERCHANT_PIN:
+            # Real EcoCash API call
+            ecocash_payload = {
+                "msisdn":           clean_phone,
+                "amount":           amount,
+                "merchantCode":     ECOCASH_MERCHANT_CODE,
+                "merchantPin":      ECOCASH_MERCHANT_PIN,
+                "merchantNumber":   ECOCASH_NUMBER.replace(" ",""),
+                "merchantName":     COMPANY_NAME,
+                "clientCorrelator": ref,
+                "narration":        f"AgroBot {plan.title()} subscription",
+                "notifyUrl":        f"https://agrobot-c6ff.onrender.com/api/payment/ecocash-notify"
+            }
+
+            try:
+                ecocash_res = requests.post(
+                    ECOCASH_API_URL,
+                    json=ecocash_payload,
+                    timeout=30,
+                    headers={"Content-Type":"application/json"}
+                )
+                ecocash_data = ecocash_res.json()
+                print(f"EcoCash API response: {ecocash_data}")
+
+                if ecocash_data.get("status") not in ["failed","error"]:
+                    # Send WhatsApp notification too
+                    send_whatsapp_message(phone,
+                        f"""💳 *Payment Request Sent!*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+A payment request of *${amount}* has been
+sent to your {method.title()} number.
+
+Please check your phone and
+enter your PIN to confirm.
+
+Plan: *{plan.upper()}*
+Amount: *${amount}*
+
+📞 Help: {SUPPORT_PHONE}""")
+
+                    return JSONResponse({
+                        "success":   True,
+                        "reference": ref,
+                        "message":   f"Payment request sent to {clean_phone}"
+                    })
+            except Exception as eco_err:
+                print(f"EcoCash API error: {eco_err}")
+                # Fall through to WhatsApp method
+
+        # ── FALLBACK: Send via WhatsApp with deep link ─────
+        # If no EcoCash API credentials, send WhatsApp instruction
+        # with a direct dial link
+
+        dial_code = "*151#" if method == "ecocash" else "*111#"
+
+        send_whatsapp_message(phone,
+            f"""💳 *Complete Your Payment*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+Plan: *{plan.upper()} — ${amount}/month*
+
+📱 *Pay via {method.title()}:*
+1️⃣ Dial {dial_code}
+2️⃣ Select: Send Money
+3️⃣ Number: *{ECOCASH_NUMBER}*
+4️⃣ Amount: *${amount}*
+5️⃣ Reference: *{ref}*
+
+After paying reply:
+*PAID {ref}*
+
+✅ Premium activates instantly!
+📞 Help: {SUPPORT_PHONE}""")
+
+        return JSONResponse({
+            "success":   True,
+            "reference": ref,
+            "message":   "Payment instructions sent via WhatsApp",
+            "fallback":  True
+        })
+
+    except Exception as e:
+        print(f"Payment initiation error: {e}")
+        return JSONResponse({
+            "success": False,
+            "message": "Could not initiate payment. Please try again."
+        }, status_code=500)
+@app.get("/api/payment/status/{reference}")
+async def check_payment_status(reference: str):
+    """Poll payment status — called by app every 5 seconds"""
+    # Check if premium was activated
+    pending = payment_pending.get(reference, {})
+    phone   = pending.get("phone","")
+
+    if is_premium(phone):
+        return JSONResponse({
+            "status":    "confirmed",
+            "active":    True,
+            "plan":      get_plan(phone),
+            "message":   "Premium active"
+        })
+
+    # Check pending status
+    status = pending.get("status","pending")
+    if status == "confirmed":
+        return JSONResponse({
+            "status":  "confirmed",
+            "active":  True,
+            "plan":    pending.get("plan","premium")
+        })
+
+    return JSONResponse({
+        "status":  status,
+        "active":  False,
+        "message": "Waiting for payment"
+    })
+
 # ── Health Check ───────────────────────────────────────────────
 @app.get("/")
 def home():
