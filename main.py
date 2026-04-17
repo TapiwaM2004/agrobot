@@ -4439,6 +4439,166 @@ async def check_payment_status(reference: str):
         "active":  False,
         "message": "Waiting for payment"
     })
+# ── Live News with Pictures ────────────────────────────────────
+GNEWS_API_KEY = os.getenv("GNEWS_API_KEY", "")
+
+@app.get("/api/news-live")
+async def get_live_news(
+    category: str = "farming",
+    phone: str = ""
+):
+    """
+    Fetch live news from GNews API with pictures.
+    Falls back to AI-generated news if API key missing.
+    """
+    # Category to search query mapping
+    queries = {
+        "farming":    "Zimbabwe farming agriculture crops",
+        "weather":    "Zimbabwe weather climate rainfall",
+        "prices":     "Zimbabwe crop commodity prices maize tobacco",
+        "livestock":  "Zimbabwe livestock cattle farmers",
+        "technology": "Africa agricultural technology innovation",
+    }
+
+    query = queries.get(category, "Zimbabwe farming agriculture")
+
+    # Try GNews API first
+    if GNEWS_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as http:
+                # Try Zimbabwe-specific first
+                res = await http.get(
+                    "https://gnews.io/api/v4/search",
+                    params={
+                        "q":      query,
+                        "lang":   "en",
+                        "max":    10,
+                        "apikey": GNEWS_API_KEY,
+                        "sortby": "publishedAt"
+                    }
+                )
+                data = res.json()
+                articles = data.get("articles", [])
+
+                # If no Zimbabwe results, try Africa
+                if len(articles) == 0:
+                    res2 = await http.get(
+                        "https://gnews.io/api/v4/search",
+                        params={
+                            "q":      "Africa " + query,
+                            "lang":   "en",
+                            "max":    10,
+                            "apikey": GNEWS_API_KEY,
+                            "sortby": "publishedAt"
+                        }
+                    )
+                    data2 = res2.json()
+                    articles = data2.get("articles", [])
+
+                if articles:
+                    return JSONResponse({
+                        "source":   "live",
+                        "articles": articles,
+                        "total":    len(articles)
+                    })
+
+        except Exception as e:
+            print(f"GNews error: {e}")
+
+    # Fallback: AI-generated news
+    try:
+        profile  = farmer_profiles.get(phone, {})
+        location = profile.get("location", "Zimbabwe")
+        info     = get_region_info(location)
+        now      = datetime.datetime.now()
+
+        prompt = f"""You are AgroBot News — Zimbabwe agricultural news service.
+Location: {location.title()}, Region {info['region']} ({info['climate']})
+Date: {now.strftime('%d %B %Y')}
+
+Generate a professional farming news bulletin with 8 sections.
+Each section must have a clear headline and 2-3 sentences.
+
+Format each section EXACTLY like this:
+SECTION_TITLE|Icon goes here
+Content of the section goes here. Second sentence. Third sentence.
+
+Sections to include:
+TOP STORY|📰
+CLIMATE ALERT|🌧️
+MARKET WATCH|💰
+CROP ADVISORY FOR {location.upper()}|🌱
+AGRI INNOVATION|🔬
+PEST ALERT|⚠️
+POLICY UPDATE|📋
+TIP OF THE WEEK|💡"""
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role":"user","content":prompt}],
+            max_tokens=800
+        )
+
+        ai_text = response.choices[0].message.content
+
+        # Parse into sections
+        sections = []
+        for line in ai_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if "|" in line:
+                # New section heading
+                parts = line.split("|", 1)
+                sections.append({
+                    "title":   parts[0].strip(),
+                    "icon":    parts[1].strip() if len(parts) > 1 else "📌",
+                    "content": ""
+                })
+            elif sections:
+                # Add to last section
+                sections[-1]["content"] += line + " "
+
+        return JSONResponse({
+            "source":   "ai",
+            "sections": sections,
+            "total":    len(sections),
+            "location": location,
+            "date":     now.strftime("%d %B %Y")
+        })
+
+    except Exception as e:
+        print(f"News AI error: {e}")
+        return JSONResponse({
+            "source":  "static",
+            "sections": [
+                {
+                    "title":   "TOP STORY",
+                    "icon":    "📰",
+                    "content": "Zimbabwe farmers are preparing for post-rainy season with focus on grain storage and soil conservation."
+                },
+                {
+                    "title":   "MARKET WATCH",
+                    "icon":    "💰",
+                    "content": "Maize prices stable at $285/tonne at GMB depots. Tobacco floors reporting rising prices for flue-cured grades. Soya demand strong at $520/tonne."
+                },
+                {
+                    "title":   "CROP ADVISORY",
+                    "icon":    "🌱",
+                    "content": "April is critical for harvesting maize at correct moisture (12-14%). Store in clean dry conditions using Shumba dust. Begin land prep for winter wheat in Region 1 and 2."
+                },
+                {
+                    "title":   "PEST ALERT",
+                    "icon":    "⚠️",
+                    "content": "Fall armyworm pressure remains moderate. Scout fields regularly. Contact Agritex: 0800 4040 for free advice."
+                },
+                {
+                    "title":   "TIP OF THE WEEK",
+                    "icon":    "💡",
+                    "content": "Apply lime to acidic soils now during dry season. Target pH 5.5-6.5 for most crops. Contact ZFC for dolomitic lime: 04-700751."
+                }
+            ]
+        })
 
 # ── Health Check ───────────────────────────────────────────────
 @app.get("/")
