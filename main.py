@@ -3157,7 +3157,7 @@ CATEGORY_QUERIES = {
 async def news_api(phone: str = "", category: str = "farming"):
     """
     Fetches live GNews articles server-side (no CORS issues).
-    Returns structured article objects with images.
+    Prioritizes articles that have real images.
     Falls back to Groq AI bulletin if GNews fails.
     """
     query = CATEGORY_QUERIES.get(category, "Zimbabwe farming agriculture")
@@ -3165,7 +3165,7 @@ async def news_api(phone: str = "", category: str = "farming"):
     # ── STEP 1: Try GNews with Zimbabwe filter ─────────────────
     try:
         async with httpx.AsyncClient(timeout=12) as http:
-            res  = await http.get(
+            res = await http.get(
                 "https://gnews.io/api/v4/search",
                 params={
                     "q":       query,
@@ -3179,10 +3179,10 @@ async def news_api(phone: str = "", category: str = "farming"):
             data     = res.json()
             articles = data.get("articles", [])
 
-        # Broaden if Zimbabwe filter returns < 3
+        # Broaden search if Zimbabwe filter returns < 3
         if len(articles) < 3:
             async with httpx.AsyncClient(timeout=12) as http:
-                res2     = await http.get(
+                res2 = await http.get(
                     "https://gnews.io/api/v4/search",
                     params={
                         "q":      query,
@@ -3195,12 +3195,41 @@ async def news_api(phone: str = "", category: str = "farming"):
                 data2    = res2.json()
                 articles = data2.get("articles", [])
 
+        # If still few articles, try top headlines for Africa
+        if len(articles) < 3:
+            async with httpx.AsyncClient(timeout=12) as http:
+                res3 = await http.get(
+                    "https://gnews.io/api/v4/top-headlines",
+                    params={
+                        "topic":  "nation",
+                        "lang":   "en",
+                        "max":    10,
+                        "apikey": GNEWS_API_KEY,
+                    },
+                )
+                data3     = res3.json()
+                articles += data3.get("articles", [])
+
         if articles:
+            # Sort: articles WITH images first, then without
+            articles_with_images    = [a for a in articles if a.get("image")]
+            articles_without_images = [a for a in articles if not a.get("image")]
+            sorted_articles = articles_with_images + articles_without_images
+
+            # Remove duplicates by title
+            seen   = set()
+            unique = []
+            for a in sorted_articles:
+                if a.get("title") not in seen:
+                    seen.add(a.get("title"))
+                    unique.append(a)
+
             return JSONResponse({
-                "source":    "live",
-                "category":  category,
-                "articles":  articles,
-                "generated": datetime.datetime.now().isoformat(),
+                "source":          "live",
+                "category":        category,
+                "articles":        unique[:10],
+                "images_available":len(articles_with_images),
+                "generated":       datetime.datetime.now().isoformat(),
             })
 
     except Exception as e:
