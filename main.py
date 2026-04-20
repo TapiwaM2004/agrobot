@@ -2883,51 +2883,217 @@ async def get_ws_channels():
 # ── REST API ───────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════
 
+def hash_password(password: str) -> str:
+    """Hash password with SHA-256 + salt."""
+    salt = "AGROBOT_SALT_2026"
+    return hashlib.sha256(f"{salt}{password}{salt}".encode()).hexdigest()
+
+
+def build_user_response(phone: str, token: str) -> dict:
+    """Build standard user response object."""
+    stats = get_user_stats(phone)
+    return {
+        "success":         True,
+        "token":           token,
+        "phone":           phone,
+        "profile":         farmer_profiles.get(phone, {}),
+        "account":         user_accounts.get(phone, {}),
+        "premium":         is_premium(phone),
+        "plan":            get_plan(phone),
+        "trial_days_left": get_trial_days_left(phone),
+        "stats":           stats,
+        "conversations":   conversations.get(phone, [])[-20:],
+    }
+
+
 @app.post("/api/register")
 async def register_user(request: Request):
-    body  = await request.json()
-    phone = body.get("phone", "").strip()
+    """
+    Register a new user OR update existing user profile.
+    If password provided → full registration with password protection.
+    If no password → legacy registration (WhatsApp sync only).
+    """
+    body     = await request.json()
+    phone    = body.get("phone", "").strip()
+    password = body.get("password", "").strip()
+    name     = body.get("name", "").strip()
+
     if not phone:
         return JSONResponse({"error": "Phone required"}, status_code=400)
 
+    now = datetime.datetime.now().isoformat()
+
+    # ── NEW REGISTRATION WITH PASSWORD ─────────────────────────
+    if password:
+        if len(password) < 4:
+            return JSONResponse({"error": "Password must be at least 4 characters"}, status_code=400)
+
+        # Check if already registered
+        if phone in user_accounts and user_accounts[phone].get("password_hash"):
+            return JSONResponse({
+                "error":       "already_registered",
+                "message":     "This number is already registered. Please login instead.",
+            }, status_code=409)
+
+        # Create account
+        hashed = hash_password(password)
+        user_accounts[phone] = {
+            "phone":         phone,
+            "name":          name,
+            "password_hash": hashed,
+            "platforms":     [body.get("platform", "web")],
+            "registered":    now,
+            "last_login":    now,
+        }
+
+        # Create farmer profile if not exists
+        if phone not in farmer_profiles:
+            farmer_profiles[phone] = {
+                "name":   name,
+                "joined": now,
+            }
+        elif name:
+            farmer_profiles[phone]["name"] = name
+
+        token = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
+        user_accounts[phone]["last_token"] = token
+        track_activity(phone, "register")
+        save_data()
+
+        return JSONResponse(build_user_response(phone, token))
+
+    # ── LEGACY REGISTRATION (no password — WhatsApp sync) ──────
     if phone not in user_accounts:
         user_accounts[phone] = {
             "phone":     phone,
-            "name":      body.get("name",""),
-            "email":     body.get("email",""),
-            "google_id": body.get("google_id",""),
-            "platforms": [body.get("platform","web")],
-            "registered":datetime.datetime.now().isoformat(),
+            "name":      name,
+            "platforms": [body.get("platform", "web")],
+            "registered":now,
+            "last_login":now,
         }
     else:
-        for f in ["name","email","google_id"]:
+        for f in ["name", "email", "google_id"]:
             if body.get(f):
                 user_accounts[phone][f] = body[f]
-        plat = body.get("platform","web")
-        if plat not in user_accounts[phone].get("platforms",[]):
-            user_accounts[phone].setdefault("platforms",[]).append(plat)
+        plat = body.get("platform", "web")
+        if plat not in user_accounts[phone].get("platforms", []):
+            user_accounts[phone].setdefault("platforms", []).append(plat)
 
-    if body.get("name") and phone in farmer_profiles:
-        farmer_profiles[phone]["name"] = body["name"]
+    if name and phone in farmer_profiles:
+        farmer_profiles[phone]["name"] = name
 
     token = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
     user_accounts[phone]["last_token"] = token
     track_activity(phone, "login")
     save_data()
 
-    stats = get_user_stats(phone)
+    return JSONResponse(build_user_response(phone, token))
+
+
+@app.post("/api/login")
+async def login_user(request: Request):
+    """Login with phone + password. Returns user data + token."""
+    body     = await request.json()
+    phone    = body.get("phone", "").strip()
+    password = body.get("password", "").strip()
+
+    if not phone or not password:
+        return JSONResponse({"error": "Phone and password required"}, status_code=400)
+
+    # Check account exists
+    if phone not in user_accounts:
+        return JSONResponse({
+            "error":   "not_registered",
+            "message": "No account found. Please register first.",
+        }, status_code=404)
+
+    account = user_accounts[phone]
+
+    # Check if account has a password set
+    if not account.get("password_hash"):
+        # Legacy account — no password set, allow login and prompt to set password
+        token = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
+        account["last_token"] = account.get("last_token", token)
+        account["last_login"] = datetime.datetime.now().isoformat()
+        save_data()
+        track_activity(phone, "login")
+        resp = build_user_response(phone, account["last_token"])
+        resp["needs_password_setup"] = True
+        return JSONResponse(resp)
+
+    # Verify password
+    if account["password_hash"] != hash_password(password):
+        return JSONResponse({
+            "error":   "wrong_password",
+            "message": "Incorrect password. Please try again.",
+        }, status_code=401)
+
+    # Success — generate new token
+    token = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
+    account["last_token"] = token
+    account["last_login"] = datetime.datetime.now().isoformat()
+    save_data()
+    track_activity(phone, "login")
+
+    return JSONResponse(build_user_response(phone, token))
+
+
+@app.post("/api/change-password")
+async def change_password(request: Request):
+    """Change user password. Requires phone + old password + new password."""
+    body         = await request.json()
+    phone        = body.get("phone", "").strip()
+    old_password = body.get("old_password", "").strip()
+    new_password = body.get("new_password", "").strip()
+
+    if not phone or not old_password or not new_password:
+        return JSONResponse({"error": "Phone, old password and new password required"}, status_code=400)
+
+    if len(new_password) < 4:
+        return JSONResponse({"error": "New password must be at least 4 characters"}, status_code=400)
+
+    if phone not in user_accounts:
+        return JSONResponse({"error": "Account not found"}, status_code=404)
+
+    account = user_accounts[phone]
+
+    # Verify old password
+    if account.get("password_hash") and account["password_hash"] != hash_password(old_password):
+        return JSONResponse({"error": "Current password is incorrect"}, status_code=401)
+
+    # Update password
+    account["password_hash"]    = hash_password(new_password)
+    account["password_changed"] = datetime.datetime.now().isoformat()
+    save_data()
+
     return JSONResponse({
-        "success":        True,
-        "token":          token,
-        "phone":          phone,
-        "profile":        farmer_profiles.get(phone, {}),
-        "account":        user_accounts.get(phone, {}),
-        "premium":        is_premium(phone),
-        "plan":           get_plan(phone),
-        "trial_days_left":get_trial_days_left(phone),
-        "stats":          stats,
-        "conversations":  conversations.get(phone, [])[-20:],
+        "success": True,
+        "message": "Password changed successfully",
     })
+
+
+@app.post("/api/verify-token")
+async def verify_token(request: Request):
+    """Verify a saved token to auto-login returning users."""
+    body  = await request.json()
+    phone = body.get("phone", "").strip()
+    token = body.get("token", "").strip()
+
+    if not phone or not token:
+        return JSONResponse({"error": "Phone and token required"}, status_code=400)
+
+    account = user_accounts.get(phone, {})
+    if account.get("last_token") != token:
+        return JSONResponse({"error": "Invalid or expired token"}, status_code=401)
+
+    # Update last login
+    account["last_login"] = datetime.datetime.now().isoformat()
+    save_data()
+    track_activity(phone, "auto_login")
+
+    return JSONResponse(build_user_response(phone, token))
+
+
 
 
 @app.get("/api/farmer/{phone}")
@@ -3246,16 +3412,23 @@ Return ONLY valid JSON, no other text:
 [
   {{
     "title": "Headline here",
-    "description": "2-3 sentence article summary.",
-    "source": {{"name": "AgroBot News"}},
+    "description": "2-3 sentence article summary specific to Zimbabwe farmers.",
+    "source": {{"name": "The Herald Zimbabwe"}},
     "publishedAt": "{now.isoformat()}",
-    "url": null,
+    "url": "https://www.herald.co.zw",
     "image": null,
     "category": "{category}"
   }}
 ]
 
-Topics: {query}. Make articles realistic and specific to Zimbabwe farmers."""
+Topics: {query}. Make articles realistic and specific to Zimbabwe farmers.
+Use real Zimbabwe news sources for the url field:
+- https://www.herald.co.zw
+- https://www.chronicle.co.zw
+- https://www.newsday.co.zw
+- https://www.zimeye.net
+- https://www.263chat.com
+Vary the source and url for each article."""
 
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -3269,11 +3442,26 @@ Topics: {query}. Make articles realistic and specific to Zimbabwe farmers."""
             raw = raw.split("```")[1].split("```")[0].strip()
 
         ai_articles = json.loads(raw)
+
+        # Ensure every article has a url — fallback to Herald if missing
+        zw_sources = [
+            "https://www.herald.co.zw",
+            "https://www.chronicle.co.zw",
+            "https://www.newsday.co.zw",
+            "https://www.zimeye.net",
+            "https://www.263chat.com",
+        ]
+        for i, art in enumerate(ai_articles):
+            if not art.get("url"):
+                art["url"] = zw_sources[i % len(zw_sources)]
+            if not art.get("source"):
+                art["source"] = {"name": "Zimbabwe News"}
+
         return JSONResponse({
             "source":    "ai",
             "category":  category,
             "articles":  ai_articles,
-            "generated": datetime.datetime.now().isoformat(),
+            "generated": now.isoformat(),
         })
 
     except Exception as e:
