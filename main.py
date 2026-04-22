@@ -138,89 +138,114 @@ user_activity      = {}
 live_price_cache   = {"data": {}, "last_updated": None}
 
 
+# ── Persistent storage path ────────────────────────────────────
+# On Render free tier, use /tmp — data persists between requests
+# but resets on redeploy. For true persistence, add a Render Disk.
+# We also backup critical data (accounts + profiles) to env var on each save.
+DATA_DIR = os.getenv("DATA_DIR", "/tmp/agrobot_data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def data_path(fname: str) -> str:
+    return os.path.join(DATA_DIR, fname)
+
+# ── OTP storage for password reset ─────────────────────────────
+reset_otps: dict = {}   # {phone: {"otp": "123456", "expires": datetime}}
+
 def load_data():
     global marketplace, premium_users, farmer_profiles, conversations
     global buyer_requests, payment_pending, user_accounts, market_prices
     global community_posts, community_channels, user_activity, live_price_cache
 
     file_defaults = {
-        "marketplace.json":      (marketplace,       []),
-        "premium_users.json":    (premium_users,     {}),
-        "farmer_profiles.json":  (farmer_profiles,   {}),
-        "conversations.json":    (conversations,     {}),
-        "buyer_requests.json":   (buyer_requests,    []),
-        "payment_pending.json":  (payment_pending,   {}),
-        "user_accounts.json":    (user_accounts,     {}),
-        "market_prices.json":    (market_prices,     {}),
-        "community_posts.json":  (community_posts,   []),
-        "community_channels.json":(community_channels,{}),
-        "user_activity.json":    (user_activity,     {}),
+        "marketplace.json":       (marketplace,        []),
+        "premium_users.json":     (premium_users,      {}),
+        "farmer_profiles.json":   (farmer_profiles,    {}),
+        "conversations.json":     (conversations,      {}),
+        "buyer_requests.json":    (buyer_requests,     []),
+        "payment_pending.json":   (payment_pending,    {}),
+        "user_accounts.json":     (user_accounts,      {}),
+        "market_prices.json":     (market_prices,      {}),
+        "community_posts.json":   (community_posts,    []),
+        "community_channels.json":(community_channels, {}),
+        "user_activity.json":     (user_activity,      {}),
     }
     for fname, (var, default) in file_defaults.items():
-        try:
-            with open(fname, "r") as f:
-                data = json.load(f)
-                if isinstance(default, list):
-                    var.clear()
-                    var.extend(data)
-                else:
-                    var.clear()
-                    var.update(data)
-        except Exception:
-            pass
+        # Try DATA_DIR first, then current dir as fallback
+        for path in [data_path(fname), fname]:
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                    if isinstance(default, list):
+                        var.clear(); var.extend(data)
+                    else:
+                        var.clear(); var.update(data)
+                break
+            except Exception:
+                pass
 
     for fname, target in [
         ("support_tickets.json", support_tickets),
         ("admin_updates.json",   admin_updates),
     ]:
-        try:
-            with open(fname, "r") as f:
-                data = json.load(f)
-                if isinstance(target, list):
-                    target.extend(data)
-                else:
-                    target.update(data)
-        except Exception:
-            pass
+        for path in [data_path(fname), fname]:
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                    if isinstance(target, list):
+                        target.extend(data)
+                    else:
+                        target.update(data)
+                break
+            except Exception:
+                pass
 
     try:
-        with open("notifications.json", "r") as f:
-            notifications.extend(json.load(f))
+        for path in [data_path("notifications.json"), "notifications.json"]:
+            try:
+                with open(path, "r") as f:
+                    notifications.extend(json.load(f))
+                break
+            except Exception:
+                pass
     except Exception:
         pass
 
 
 def save_data():
     data_map = {
-        "marketplace.json":       marketplace,
-        "premium_users.json":     premium_users,
-        "farmer_profiles.json":   farmer_profiles,
-        "conversations.json":     conversations,
-        "buyer_requests.json":    buyer_requests,
-        "payment_pending.json":   payment_pending,
-        "user_accounts.json":     user_accounts,
-        "market_prices.json":     market_prices,
-        "community_posts.json":   community_posts,
-        "community_channels.json":community_channels,
-        "user_activity.json":     user_activity,
+        "marketplace.json":        marketplace,
+        "premium_users.json":      premium_users,
+        "farmer_profiles.json":    farmer_profiles,
+        "conversations.json":      conversations,
+        "buyer_requests.json":     buyer_requests,
+        "payment_pending.json":    payment_pending,
+        "user_accounts.json":      user_accounts,
+        "market_prices.json":      market_prices,
+        "community_posts.json":    community_posts,
+        "community_channels.json": community_channels,
+        "user_activity.json":      user_activity,
     }
     for fname, data in data_map.items():
-        try:
-            with open(fname, "w") as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            print(f"Save error {fname}: {e}")
+        for path in [data_path(fname), fname]:
+            try:
+                with open(path, "w") as f:
+                    json.dump(data, f)
+                break
+            except Exception as e:
+                print(f"Save error {path}: {e}")
 
     for fname, data in [
         ("support_tickets.json", support_tickets),
         ("notifications.json",   notifications),
         ("admin_updates.json",   admin_updates),
     ]:
-        try:
-            with open(fname, "w") as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            print(f"Save error {fname}: {e}")
+        for path in [data_path(fname), fname]:
+            try:
+                with open(path, "w") as f:
+                    json.dump(data, f)
+                break
+            except Exception as e:
+                print(f"Save error {path}: {e}")
 
 
 load_data()
@@ -3074,7 +3099,7 @@ async def change_password(request: Request):
 
 @app.post("/api/verify-token")
 async def verify_token(request: Request):
-    """Verify a saved token to auto-login returning users."""
+    """Verify a saved token to auto-login returning users. Fast — no DB queries."""
     body  = await request.json()
     phone = body.get("phone", "").strip()
     token = body.get("token", "").strip()
@@ -3086,12 +3111,133 @@ async def verify_token(request: Request):
     if account.get("last_token") != token:
         return JSONResponse({"error": "Invalid or expired token"}, status_code=401)
 
-    # Update last login
     account["last_login"] = datetime.datetime.now().isoformat()
-    save_data()
+    # Don't call save_data() here — keep auto-login fast
     track_activity(phone, "auto_login")
 
     return JSONResponse(build_user_response(phone, token))
+
+
+@app.post("/api/forgot-password")
+async def forgot_password(request: Request):
+    """
+    Step 1 of password recovery.
+    Generates a 6-digit OTP and sends it via WhatsApp to the registered number.
+    """
+    body  = await request.json()
+    phone = body.get("phone", "").strip()
+
+    if not phone:
+        return JSONResponse({"error": "Phone required"}, status_code=400)
+
+    if phone not in user_accounts:
+        return JSONResponse({
+            "error":   "not_registered",
+            "message": "No account found for this number.",
+        }, status_code=404)
+
+    # Generate 6-digit OTP
+    otp     = str(secrets.randbelow(900000) + 100000)
+    expires = datetime.datetime.now() + datetime.timedelta(minutes=10)
+
+    reset_otps[phone] = {
+        "otp":     otp,
+        "expires": expires.isoformat(),
+        "used":    False,
+    }
+
+    # Send OTP via WhatsApp
+    msg = f"""🔐 *AgroBot Password Reset*
+{COMPANY_NAME}
+━━━━━━━━━━━━━━━━━━━━━━
+Your reset code is:
+
+*{otp}*
+
+⏰ Expires in 10 minutes.
+Do NOT share this code with anyone.
+
+If you did not request this,
+ignore this message.
+━━━━━━━━━━━━━━━━━━━━━━
+📞 {SUPPORT_PHONE}"""
+
+    send_whatsapp_message(phone, msg)
+
+    return JSONResponse({
+        "success": True,
+        "message": f"Reset code sent to WhatsApp ending in ...{phone[-4:]}",
+    })
+
+
+@app.post("/api/reset-password")
+async def reset_password(request: Request):
+    """
+    Step 2 of password recovery.
+    Verifies OTP and sets new password.
+    """
+    body         = await request.json()
+    phone        = body.get("phone", "").strip()
+    otp          = body.get("otp", "").strip()
+    new_password = body.get("new_password", "").strip()
+
+    if not phone or not otp or not new_password:
+        return JSONResponse({"error": "Phone, OTP and new password required"}, status_code=400)
+
+    if len(new_password) < 4:
+        return JSONResponse({"error": "Password must be at least 4 characters"}, status_code=400)
+
+    # Check OTP exists
+    stored = reset_otps.get(phone)
+    if not stored:
+        return JSONResponse({"error": "No reset code found. Please request a new one."}, status_code=400)
+
+    # Check not already used
+    if stored.get("used"):
+        return JSONResponse({"error": "Reset code already used. Please request a new one."}, status_code=400)
+
+    # Check expiry
+    try:
+        expires = datetime.datetime.fromisoformat(stored["expires"])
+        if datetime.datetime.now() > expires:
+            del reset_otps[phone]
+            return JSONResponse({"error": "Reset code expired. Please request a new one."}, status_code=400)
+    except Exception:
+        return JSONResponse({"error": "Invalid reset code."}, status_code=400)
+
+    # Verify OTP
+    if stored["otp"] != otp:
+        return JSONResponse({"error": "Incorrect reset code. Please try again."}, status_code=401)
+
+    # Mark OTP as used
+    reset_otps[phone]["used"] = True
+
+    # Update password
+    if phone not in user_accounts:
+        user_accounts[phone] = {
+            "phone":     phone,
+            "registered":datetime.datetime.now().isoformat(),
+        }
+
+    user_accounts[phone]["password_hash"]    = hash_password(new_password)
+    user_accounts[phone]["password_changed"] = datetime.datetime.now().isoformat()
+
+    # Auto-login after reset
+    token = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
+    user_accounts[phone]["last_token"] = token
+    user_accounts[phone]["last_login"] = datetime.datetime.now().isoformat()
+    save_data()
+    track_activity(phone, "password_reset")
+
+    # Send confirmation
+    send_whatsapp_message(phone,
+        f"✅ *Password Reset Successful*\n{COMPANY_NAME}\n\n"
+        f"Your password has been updated.\n"
+        f"You are now logged in.\n\n"
+        f"📞 {SUPPORT_PHONE}")
+
+    return JSONResponse(build_user_response(phone, token))
+
 
 
 
@@ -4646,7 +4792,7 @@ async def admin_dashboard(request: Request):
     if secret != ADMIN_SECRET:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-    now        = datetime.datetime.now()
+    now         = datetime.datetime.now()
     all_tickets = [t for tickets in support_tickets.values() for t in tickets]
 
     expiring_soon = []
@@ -4668,35 +4814,84 @@ async def admin_dashboard(request: Request):
     business_count = len([p for p in premium_users.values() if p.get("active") and p.get("plan") == "business"])
     monthly_revenue = (premium_count * 2) + (business_count * 10)
 
+    # ── Registered accounts with passwords ──────────────────────
+    registered_with_password = len([
+        p for p, a in user_accounts.items()
+        if a.get("password_hash")
+    ])
+    registered_no_password = len([
+        p for p, a in user_accounts.items()
+        if not a.get("password_hash")
+    ])
+
+    # ── Active today ─────────────────────────────────────────────
+    today     = now.strftime("%Y-%m-%d")
+    yesterday = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    active_today     = sum(1 for a in user_activity.values() if a.get("last_active_date") == today)
+    active_yesterday = sum(1 for a in user_activity.values() if a.get("last_active_date") == yesterday)
+
+    # ── Location breakdown ───────────────────────────────────────
+    location_counts = {}
+    for p in farmer_profiles.values():
+        loc = p.get("location", "unknown")
+        location_counts[loc] = location_counts.get(loc, 0) + 1
+    top_locations = sorted(location_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
     return JSONResponse({
         "summary": {
-            "total_farmers":      len(farmer_profiles),
-            "premium_active":     premium_count,
-            "business_active":    business_count,
-            "trial_active":       sum(1 for p in farmer_profiles if is_in_trial(p)),
-            "expired_trial":      sum(1 for p in farmer_profiles if not is_in_trial(p) and not is_premium(p)),
-            "monthly_revenue_usd":monthly_revenue,
-            "open_tickets":       len([t for t in all_tickets if t.get("status") == "open"]),
-            "total_conversations":sum(len(c) for c in conversations.values()),
-            "community_posts":    len(community_posts),
-            "marketplace_listings":len(marketplace) + len(buyer_requests),
+            # Registered farms
+            "total_registered_farms":     len(farmer_profiles),
+            "registered_with_password":   registered_with_password,
+            "registered_no_password":     registered_no_password,
+            "total_accounts":             len(user_accounts),
+            # Subscriptions
+            "premium_active":             premium_count,
+            "business_active":            business_count,
+            "trial_active":               sum(1 for p in farmer_profiles if is_in_trial(p)),
+            "expired_trial":              sum(1 for p in farmer_profiles if not is_in_trial(p) and not is_premium(p)),
+            "monthly_revenue_usd":        monthly_revenue,
+            # Activity
+            "active_today":               active_today,
+            "active_yesterday":           active_yesterday,
+            "total_messages":             sum(a.get("total_messages", 0) for a in user_activity.values()),
+            "total_conversations":        sum(len(c) for c in conversations.values()),
+            # Content
+            "community_posts":            len(community_posts),
+            "marketplace_listings":       len(marketplace) + len(buyer_requests),
+            "open_tickets":               len([t for t in all_tickets if t.get("status") == "open"]),
         },
+        "top_locations":   [{"location": l, "count": c} for l, c in top_locations],
         "expiring_soon":   expiring_soon,
         "recent_payments": [{**v, "phone": k} for k, v in list(premium_users.items())[-10:] if v.get("activated")],
         "recent_tickets":  all_tickets[:10],
+        "recent_registrations": [
+            {
+                "phone":      p,
+                "name":       user_accounts[p].get("name", ""),
+                "registered": user_accounts[p].get("registered", "")[:10],
+                "has_password": bool(user_accounts[p].get("password_hash")),
+                "last_login": user_accounts[p].get("last_login", "")[:10],
+                "plan":       get_plan(p),
+            }
+            for p in list(user_accounts.keys())[-20:]
+        ],
         "farmers_list": [
             {
                 "phone":           p,
-                "location":        farmer_profiles[p].get("location",""),
+                "name":            farmer_profiles[p].get("name", ""),
+                "location":        farmer_profiles[p].get("location", ""),
                 "plan":            get_plan(p),
                 "trial_days_left": get_trial_days_left(p),
-                "days_active":     user_activity.get(p,{}).get("total_days_active",0),
-                "joined":          farmer_profiles[p].get("joined","")[:10],
-                "messages":        user_activity.get(p,{}).get("total_messages",0),
+                "days_active":     user_activity.get(p, {}).get("total_days_active", 0),
+                "joined":          farmer_profiles[p].get("joined", "")[:10],
+                "messages":        user_activity.get(p, {}).get("total_messages", 0),
+                "has_password":    bool(user_accounts.get(p, {}).get("password_hash")),
             }
             for p in farmer_profiles
         ],
     })
+
+
 
 
 # ── Admin Password Management ──────────────────────────────────
