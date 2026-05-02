@@ -3882,8 +3882,9 @@ def send_whatsapp_message(to: str, message: str):
 # ── Background: Refresh prices every 6 hours ──────────────────
 @app.on_event("startup")
 async def startup_event():
-    print(f"🌱 {BOT_NAME} v4.1.0 starting...")
+    print(f"🌱 {BOT_NAME} v4.2.0 starting...")
     print(f"📊 {COMPANY_NAME}")
+    print(f"🗄️  Supabase: {'Connected' if sb else 'Not connected — using local storage'}")
     asyncio.create_task(refresh_prices_background())
 
 
@@ -3925,10 +3926,8 @@ async def create_support_ticket(request: Request):
         "resolved": False,
     }
 
-    if phone not in support_tickets:
-        support_tickets[phone] = []
-    support_tickets[phone].append(ticket)
-    save_data()
+    # Save to Supabase + local
+    db_save_ticket(ticket)
 
     send_whatsapp_message(phone, f"""✅ *Support Ticket Created*
 {COMPANY_NAME}
@@ -3946,26 +3945,34 @@ We will respond within 24 hours.
 
 @app.get("/api/support/tickets/{phone}")
 async def get_user_tickets(phone: str):
+    """Get tickets for a user — checks Supabase."""
+    if sb:
+        try:
+            r = sb.table("support_tickets").select("*").eq("phone", phone)\
+                .order("created_at", desc=True).execute()
+            tickets = []
+            for row in (r.data or []):
+                row["replies"] = json.loads(row.get("replies", "[]") or "[]")
+                tickets.append(row)
+            return JSONResponse({"phone": phone, "total": len(tickets), "tickets": tickets})
+        except Exception as e:
+            print(f"get_user_tickets error: {e}")
     tickets = support_tickets.get(phone, [])
     return JSONResponse({"phone": phone, "total": len(tickets), "tickets": tickets})
 
 
 @app.get("/api/support/all")
 async def get_all_tickets(request: Request):
+    """Get all tickets — from Supabase for admin."""
     secret = request.headers.get("x-admin-secret", "")
     if secret != ADMIN_SECRET:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-    all_tickets = []
-    for phone, tickets in support_tickets.items():
-        for t in tickets:
-            all_tickets.append({**t, "user_phone": phone})
-    all_tickets.sort(key=lambda x: x.get("created", ""), reverse=True)
-
+    all_tickets = db_get_all_tickets()
     return JSONResponse({
         "total":    len(all_tickets),
-        "open":     len([t for t in all_tickets if t["status"] == "open"]),
-        "resolved": len([t for t in all_tickets if t["status"] == "resolved"]),
+        "open":     len([t for t in all_tickets if t.get("status") == "open"]),
+        "resolved": len([t for t in all_tickets if t.get("status") == "resolved"]),
         "tickets":  all_tickets,
     })
 
@@ -3981,31 +3988,56 @@ async def reply_to_ticket(request: Request):
     reply_msg = body.get("reply", "")
     resolve   = body.get("resolve", False)
 
-    for phone, tickets in support_tickets.items():
-        for ticket in tickets:
-            if ticket["id"] == ticket_id:
-                ticket["replies"].append({
-                    "message":   reply_msg,
-                    "from":      "admin",
-                    "timestamp": datetime.datetime.now().isoformat(),
-                })
-                if resolve:
-                    ticket["status"]   = "resolved"
-                    ticket["resolved"] = True
-                save_data()
-                send_whatsapp_message(phone, f"""📬 *Support Reply — {COMPANY_NAME}*
+    # Find in Supabase first
+    ticket_found = None
+    phone_found  = None
+
+    if sb:
+        try:
+            r = sb.table("support_tickets").select("*").eq("id", ticket_id).execute()
+            if r.data:
+                ticket_found = r.data[0]
+                ticket_found["replies"] = json.loads(ticket_found.get("replies", "[]") or "[]")
+                phone_found = ticket_found["phone"]
+        except Exception as e:
+            print(f"reply ticket Supabase error: {e}")
+
+    # Fall back to local
+    if not ticket_found:
+        for phone, tickets in support_tickets.items():
+            for ticket in tickets:
+                if ticket["id"] == ticket_id:
+                    ticket_found = ticket
+                    phone_found  = phone
+                    break
+
+    if not ticket_found:
+        return JSONResponse({"error": "Ticket not found"}, status_code=404)
+
+    ticket_found["replies"].append({
+        "message":   reply_msg,
+        "from":      "admin",
+        "timestamp": datetime.datetime.now().isoformat(),
+    })
+    if resolve:
+        ticket_found["status"]   = "resolved"
+        ticket_found["resolved"] = True
+
+    # Save back to Supabase
+    db_save_ticket(ticket_found)
+
+    send_whatsapp_message(phone_found, f"""📬 *Support Reply — {COMPANY_NAME}*
 ━━━━━━━━━━━━━━━━━━━━━━
 🎫 Ticket: *{ticket_id}*
-📋 Subject: {ticket.get('subject','')}
+📋 Subject: {ticket_found.get('subject','')}
 
 💬 *Response:*
 {reply_msg}
 
 Status: {'✅ Resolved' if resolve else '🔄 In Progress'}
 Reply here or call: {SUPPORT_PHONE}""")
-                return JSONResponse({"success": True, "ticket_id": ticket_id})
 
-    return JSONResponse({"error": "Ticket not found"}, status_code=404)
+    return JSONResponse({"success": True, "ticket_id": ticket_id})
 
 
 @app.post("/api/support/admin-fix")
@@ -4792,103 +4824,159 @@ async def admin_dashboard(request: Request):
     if secret != ADMIN_SECRET:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-    now         = datetime.datetime.now()
-    all_tickets = [t for tickets in support_tickets.values() for t in tickets]
+    now = datetime.datetime.now()
 
+    # ── Pull fresh data from Supabase ──────────────────────────
+    all_farmers_db  = db_get_all_farmers()
+    all_accounts_db = db_get_all_accounts()
+    all_tickets     = db_get_all_tickets()
+
+    # Merge with in-memory for completeness
+    all_phones = set(list(farmer_profiles.keys()) + [f["phone"] for f in all_farmers_db])
+
+    # ── Premium stats ──────────────────────────────────────────
+    all_premium = {}
+    if sb:
+        try:
+            r = sb.table("premium_users").select("*").eq("active", True).execute()
+            for row in (r.data or []):
+                all_premium[row["phone"]] = row
+        except Exception as e:
+            print(f"premium fetch error: {e}")
+    all_premium.update({k: v for k, v in premium_users.items() if v.get("active")})
+
+    premium_count  = len([p for p in all_premium.values() if p.get("plan") == "premium"])
+    business_count = len([p for p in all_premium.values() if p.get("plan") == "business"])
+    monthly_revenue = (premium_count * 2) + (business_count * 10)
+
+    # ── Accounts with passwords ────────────────────────────────
+    all_accts = {**{a["phone"]: a for a in all_accounts_db.values()
+                    if isinstance(all_accounts_db, dict)}, **user_accounts}
+    if isinstance(all_accounts_db, dict):
+        all_accts.update(all_accounts_db)
+
+    registered_with_password = len([a for a in all_accts.values() if a.get("password_hash")])
+    registered_no_password   = len([a for a in all_accts.values() if not a.get("password_hash")])
+
+    # ── Activity stats ─────────────────────────────────────────
+    today     = now.strftime("%Y-%m-%d")
+    yesterday = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    all_activity = dict(user_activity)
+    if sb:
+        try:
+            r = sb.table("user_activity").select("phone,total_messages,last_active_date").execute()
+            for row in (r.data or []):
+                if row["phone"] not in all_activity:
+                    all_activity[row["phone"]] = row
+        except Exception:
+            pass
+
+    active_today     = sum(1 for a in all_activity.values() if a.get("last_active_date") == today)
+    active_yesterday = sum(1 for a in all_activity.values() if a.get("last_active_date") == yesterday)
+    total_messages   = sum(a.get("total_messages", 0) for a in all_activity.values())
+
+    # ── Location breakdown ─────────────────────────────────────
+    location_counts = {}
+    all_profiles = {**{f["phone"]: f for f in all_farmers_db}, **farmer_profiles}
+    for p in all_profiles.values():
+        loc = p.get("location", "unknown") or "unknown"
+        location_counts[loc] = location_counts.get(loc, 0) + 1
+    top_locations = sorted(location_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    # ── Expiring soon ──────────────────────────────────────────
     expiring_soon = []
-    for phone, data in premium_users.items():
+    for phone, data in all_premium.items():
         if data.get("active"):
             try:
-                exp = datetime.datetime.fromisoformat(data.get("expires",""))
+                exp = datetime.datetime.fromisoformat(str(data.get("expires", ""))[:26])
                 if (exp - now).days <= 7:
                     expiring_soon.append({
                         "phone":     phone,
                         "plan":      data.get("plan"),
-                        "expires":   data.get("expires"),
+                        "expires":   str(data.get("expires", ""))[:10],
                         "days_left": (exp - now).days,
                     })
             except Exception:
                 pass
 
-    premium_count  = len([p for p in premium_users.values() if p.get("active") and p.get("plan") == "premium"])
-    business_count = len([p for p in premium_users.values() if p.get("active") and p.get("plan") == "business"])
-    monthly_revenue = (premium_count * 2) + (business_count * 10)
+    # ── Marketplace count ──────────────────────────────────────
+    marketplace_count = len(marketplace) + len(buyer_requests)
+    if sb:
+        try:
+            r = sb.table("marketplace").select("id", count="exact").eq("status", "active").execute()
+            if hasattr(r, "count") and r.count:
+                marketplace_count = r.count
+        except Exception:
+            pass
 
-    # ── Registered accounts with passwords ──────────────────────
-    registered_with_password = len([
-        p for p, a in user_accounts.items()
-        if a.get("password_hash")
-    ])
-    registered_no_password = len([
-        p for p, a in user_accounts.items()
-        if not a.get("password_hash")
-    ])
+    # ── Community posts count ──────────────────────────────────
+    posts_count = len(community_posts)
+    if sb:
+        try:
+            r = sb.table("community_posts").select("id", count="exact").execute()
+            if hasattr(r, "count") and r.count:
+                posts_count = r.count
+        except Exception:
+            pass
 
-    # ── Active today ─────────────────────────────────────────────
-    today     = now.strftime("%Y-%m-%d")
-    yesterday = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    active_today     = sum(1 for a in user_activity.values() if a.get("last_active_date") == today)
-    active_yesterday = sum(1 for a in user_activity.values() if a.get("last_active_date") == yesterday)
-
-    # ── Location breakdown ───────────────────────────────────────
-    location_counts = {}
-    for p in farmer_profiles.values():
-        loc = p.get("location", "unknown")
-        location_counts[loc] = location_counts.get(loc, 0) + 1
-    top_locations = sorted(location_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    # ── Build farmers list ─────────────────────────────────────
+    farmers_list = []
+    for phone in all_phones:
+        profile  = all_profiles.get(phone, {})
+        activity = all_activity.get(phone, {})
+        account  = all_accts.get(phone, {})
+        farmers_list.append({
+            "phone":           phone,
+            "name":            profile.get("name", account.get("name", "")),
+            "location":        profile.get("location", ""),
+            "plan":            get_plan(phone),
+            "trial_days_left": get_trial_days_left(phone),
+            "days_active":     activity.get("total_days_active", 0),
+            "joined":          str(profile.get("joined", ""))[:10],
+            "messages":        activity.get("total_messages", 0),
+            "has_password":    bool(account.get("password_hash")),
+        })
 
     return JSONResponse({
         "summary": {
-            # Registered farms
-            "total_registered_farms":     len(farmer_profiles),
-            "registered_with_password":   registered_with_password,
-            "registered_no_password":     registered_no_password,
-            "total_accounts":             len(user_accounts),
-            # Subscriptions
-            "premium_active":             premium_count,
-            "business_active":            business_count,
-            "trial_active":               sum(1 for p in farmer_profiles if is_in_trial(p)),
-            "expired_trial":              sum(1 for p in farmer_profiles if not is_in_trial(p) and not is_premium(p)),
-            "monthly_revenue_usd":        monthly_revenue,
-            # Activity
-            "active_today":               active_today,
-            "active_yesterday":           active_yesterday,
-            "total_messages":             sum(a.get("total_messages", 0) for a in user_activity.values()),
-            "total_conversations":        sum(len(c) for c in conversations.values()),
-            # Content
-            "community_posts":            len(community_posts),
-            "marketplace_listings":       len(marketplace) + len(buyer_requests),
-            "open_tickets":               len([t for t in all_tickets if t.get("status") == "open"]),
+            "total_registered_farms":   len(all_phones),
+            "registered_with_password": registered_with_password,
+            "registered_no_password":   registered_no_password,
+            "total_accounts":           len(all_accts),
+            "premium_active":           premium_count,
+            "business_active":          business_count,
+            "trial_active":             sum(1 for p in all_phones if is_in_trial(p)),
+            "expired_trial":            sum(1 for p in all_phones if not is_in_trial(p) and not is_premium(p)),
+            "monthly_revenue_usd":      monthly_revenue,
+            "active_today":             active_today,
+            "active_yesterday":         active_yesterday,
+            "total_messages":           total_messages,
+            "total_conversations":      sum(len(c) for c in conversations.values()),
+            "community_posts":          posts_count,
+            "marketplace_listings":     marketplace_count,
+            "open_tickets":             len([t for t in all_tickets if t.get("status") == "open"]),
         },
         "top_locations":   [{"location": l, "count": c} for l, c in top_locations],
         "expiring_soon":   expiring_soon,
-        "recent_payments": [{**v, "phone": k} for k, v in list(premium_users.items())[-10:] if v.get("activated")],
+        "recent_payments": [
+            {**v, "phone": k}
+            for k, v in list(all_premium.items())[-10:]
+            if v.get("activated")
+        ],
         "recent_tickets":  all_tickets[:10],
         "recent_registrations": [
             {
-                "phone":      p,
-                "name":       user_accounts[p].get("name", ""),
-                "registered": user_accounts[p].get("registered", "")[:10],
-                "has_password": bool(user_accounts[p].get("password_hash")),
-                "last_login": user_accounts[p].get("last_login", "")[:10],
-                "plan":       get_plan(p),
+                "phone":        p,
+                "name":         all_accts.get(p, {}).get("name", ""),
+                "registered":   str(all_accts.get(p, {}).get("registered", ""))[:10],
+                "has_password": bool(all_accts.get(p, {}).get("password_hash")),
+                "last_login":   str(all_accts.get(p, {}).get("last_login", ""))[:10],
+                "plan":         get_plan(p),
             }
-            for p in list(user_accounts.keys())[-20:]
+            for p in list(all_accts.keys())[-20:]
         ],
-        "farmers_list": [
-            {
-                "phone":           p,
-                "name":            farmer_profiles[p].get("name", ""),
-                "location":        farmer_profiles[p].get("location", ""),
-                "plan":            get_plan(p),
-                "trial_days_left": get_trial_days_left(p),
-                "days_active":     user_activity.get(p, {}).get("total_days_active", 0),
-                "joined":          farmer_profiles[p].get("joined", "")[:10],
-                "messages":        user_activity.get(p, {}).get("total_messages", 0),
-                "has_password":    bool(user_accounts.get(p, {}).get("password_hash")),
-            }
-            for p in farmer_profiles
-        ],
+        "farmers_list": farmers_list,
     })
 
 
