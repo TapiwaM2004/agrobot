@@ -1,0 +1,37 @@
+{
+  "general": {
+    "name": "\ud83c\udf0d General Farming",
+    "description": "All farming topics",
+    "messages": []
+  },
+  "maize": {
+    "name": "\ud83c\udf3d Maize Farmers",
+    "description": "Maize growing community",
+    "messages": []
+  },
+  "tobacco": {
+    "name": "\ud83c\udf42 Tobacco Growers",
+    "description": "Tobacco farming",
+    "messages": []
+  },
+  "livestock": {
+    "name": "\ud83d\udc04 Livestock Farmers",
+    "description": "Cattle, goats, poultry",
+    "messages": []
+  },
+  "horticulture": {
+    "name": "\ud83e\udd6c Horticulture",
+    "description": "Vegetables & fruits",
+    "messages": []
+  },
+  "weather": {
+    "name": "\ud83c\udf27\ufe0f Weather Reports",
+    "description": "Local weather sharing",
+    "messages": []
+  },
+  "prices": {
+    "name": "\ud83d\udcb0 Market Prices",
+    "description": "Price discussions",
+    "messages": []
+  }
+}
