@@ -3941,12 +3941,23 @@ def send_whatsapp_message(to: str, message: str):
 
 
 # ── Background: Refresh prices every 6 hours ──────────────────
+async def keep_supabase_alive():
+    while True:
+        await asyncio.sleep(86400 * 4)  # every 4 days
+        try:
+            if sb:
+                sb.table("farmer_profiles").select("phone").limit(1).execute()
+                print("✅ Supabase keep-alive ping sent")
+        except Exception as e:
+            print(f"Keep-alive error: {e}")
+
 @app.on_event("startup")
 async def startup_event():
     print(f"🌱 {BOT_NAME} v4.2.0 starting...")
     print(f"📊 {COMPANY_NAME}")
     print(f"🗄️  Supabase: {'Connected' if sb else 'Not connected — using local storage'}")
     asyncio.create_task(refresh_prices_background())
+    asyncio.create_task(keep_supabase_alive())
 
 
 async def refresh_prices_background():
