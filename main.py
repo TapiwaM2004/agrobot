@@ -40,6 +40,8 @@ VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN", "agrobot123")
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
 GNEWS_API_KEY     = os.getenv("GNEWS_API_KEY", "86b26ba02bf77b0ca9826d4e95ba089e")
 ADMIN_SECRET      = os.getenv("ADMIN_SECRET", "AGROBOT_ADMIN_2026")
+SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY      = os.getenv("SUPABASE_KEY", "")
 ECOCASH_NUMBER    = "0787 341 018"
 ONEMONEY_NUMBER   = "0787 341 018"
 SUPPORT_PHONE     = "0787 341 018"
@@ -50,6 +52,268 @@ WEBSITE           = "agrobot.co.zw"
 TRIAL_DAYS        = 30
 
 client = Groq(api_key=GROQ_API_KEY)
+
+# ── Supabase Client ────────────────────────────────────────────
+sb = None
+try:
+    from supabase import create_client
+    if SUPABASE_URL and SUPABASE_KEY:
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Supabase connected!")
+    else:
+        print("⚠️ Supabase env vars not set — using local storage")
+except Exception as _sb_err:
+    print(f"⚠️ Supabase not available: {_sb_err}")
+
+# ── Persistent storage path ────────────────────────────────────
+DATA_DIR = os.getenv("DATA_DIR", "/tmp/agrobot_data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def data_path(fname):
+    return os.path.join(DATA_DIR, fname)
+
+# ── OTP storage ────────────────────────────────────────────────
+reset_otps = {}
+
+# ══════════════════════════════════════════════════════════════
+# ── DATABASE LAYER ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+def db_upsert(table, row, conflict_col="phone"):
+    if not sb: return
+    try:
+        sb.table(table).upsert(row).execute()
+    except Exception as e:
+        print(f"db_upsert {table} error: {e}")
+
+def db_select(table, filters=None, limit=None, order_col=None, desc=False):
+    if not sb: return []
+    try:
+        q = sb.table(table).select("*")
+        if filters:
+            for col, val in filters.items():
+                q = q.eq(col, val)
+        if order_col:
+            q = q.order(order_col, desc=desc)
+        if limit:
+            q = q.limit(limit)
+        r = q.execute()
+        return r.data or []
+    except Exception as e:
+        print(f"db_select {table} error: {e}")
+        return []
+
+def db_save_account(phone, data):
+    user_accounts[phone] = data
+    row = {
+        "phone":         phone,
+        "name":          data.get("name", ""),
+        "password_hash": data.get("password_hash", ""),
+        "last_token":    data.get("last_token", ""),
+        "last_login":    data.get("last_login"),
+        "registered":    data.get("registered", datetime.datetime.now().isoformat()),
+        "platforms":     data.get("platforms", ["web"]),
+        "data":          json.dumps({k: v for k, v in data.items()
+                                     if k not in ["phone","name","password_hash",
+                                                  "last_token","last_login","registered","platforms"]}),
+    }
+    db_upsert("user_accounts", row)
+
+def db_get_account(phone):
+    if phone in user_accounts:
+        return user_accounts[phone]
+    rows = db_select("user_accounts", {"phone": phone})
+    if rows:
+        row   = rows[0]
+        extra = json.loads(row.pop("data", "{}") or "{}")
+        data  = {**row, **extra}
+        user_accounts[phone] = data
+        return data
+    return {}
+
+def db_save_profile(phone, data):
+    farmer_profiles[phone] = data
+    row = {
+        "phone":    phone,
+        "name":     data.get("name", ""),
+        "location": data.get("location", ""),
+        "gps_lat":  data.get("gps_lat"),
+        "gps_lon":  data.get("gps_lon"),
+        "joined":   data.get("joined", datetime.datetime.now().isoformat()),
+        "data":     json.dumps({k: v for k, v in data.items()
+                                if k not in ["phone","name","location","gps_lat","gps_lon","joined"]}),
+    }
+    db_upsert("farmer_profiles", row)
+
+def db_get_profile(phone):
+    if phone in farmer_profiles:
+        return farmer_profiles[phone]
+    rows = db_select("farmer_profiles", {"phone": phone})
+    if rows:
+        row   = rows[0]
+        extra = json.loads(row.pop("data", "{}") or "{}")
+        data  = {**row, **extra}
+        farmer_profiles[phone] = data
+        return data
+    return {}
+
+def db_save_premium(phone, data):
+    premium_users[phone] = data
+    row = {
+        "phone":       phone,
+        "plan":        data.get("plan", "premium"),
+        "active":      data.get("active", True),
+        "amount":      str(data.get("amount", "2")),
+        "activated":   data.get("activated", datetime.datetime.now().isoformat()),
+        "expires":     data.get("expires"),
+        "payment_ref": data.get("payment_ref", ""),
+        "data":        json.dumps({k: v for k, v in data.items()
+                                   if k not in ["phone","plan","active","amount",
+                                                "activated","expires","payment_ref"]}),
+    }
+    db_upsert("premium_users", row)
+
+def db_get_premium(phone):
+    if phone in premium_users:
+        return premium_users[phone]
+    rows = db_select("premium_users", {"phone": phone})
+    if rows:
+        row   = rows[0]
+        extra = json.loads(row.pop("data", "{}") or "{}")
+        data  = {**row, **extra}
+        premium_users[phone] = data
+        return data
+    return {}
+
+def db_save_conversation(phone, role, message, msg_type="text"):
+    if not sb: return
+    try:
+        sb.table("conversations").insert({
+            "phone":    phone,
+            "role":     role,
+            "message":  message[:2000],
+            "msg_type": msg_type,
+            "platform": "web",
+        }).execute()
+    except Exception as e:
+        print(f"db_save_conversation error: {e}")
+
+def db_get_conversations(phone, limit=20):
+    rows = db_select("conversations", {"phone": phone},
+                     limit=limit, order_col="created_at", desc=True)
+    if rows:
+        return [{"role": r["role"], "message": r["message"],
+                 "type": r.get("msg_type","text"), "timestamp": str(r["created_at"])}
+                for r in reversed(rows)]
+    return conversations.get(phone, [])[-limit:]
+
+def db_save_activity(phone, data):
+    user_activity[phone] = data
+    row = {
+        "phone":             phone,
+        "total_messages":    data.get("total_messages", 0),
+        "total_days_active": data.get("total_days_active", 0),
+        "streak_days":       data.get("streak_days", 0),
+        "last_active_date":  data.get("last_active_date", ""),
+        "last_seen":         data.get("last_seen", datetime.datetime.now().isoformat()),
+        "first_seen":        data.get("first_seen", datetime.datetime.now().isoformat()),
+        "data":              json.dumps({"daily_activity": data.get("daily_activity", {}),
+                                         "actions": data.get("actions", {})}),
+    }
+    db_upsert("user_activity", row)
+
+def db_get_activity(phone):
+    if phone in user_activity:
+        return user_activity[phone]
+    rows = db_select("user_activity", {"phone": phone})
+    if rows:
+        row   = rows[0]
+        extra = json.loads(row.pop("data", "{}") or "{}")
+        data  = {**row, **extra}
+        user_activity[phone] = data
+        return data
+    return {}
+
+def db_save_ticket(ticket):
+    phone = ticket.get("phone", "")
+    if phone not in support_tickets:
+        support_tickets[phone] = []
+    existing = [t for t in support_tickets[phone] if t["id"] == ticket["id"]]
+    if existing:
+        existing[0].update(ticket)
+    else:
+        support_tickets[phone].append(ticket)
+    if not sb: return
+    try:
+        sb.table("support_tickets").upsert({
+            "id":       ticket["id"],
+            "phone":    phone,
+            "subject":  ticket.get("subject", ""),
+            "message":  ticket.get("message", ""),
+            "category": ticket.get("category", "general"),
+            "status":   ticket.get("status", "open"),
+            "replies":  json.dumps(ticket.get("replies", [])),
+            "resolved": ticket.get("resolved", False),
+        }).execute()
+    except Exception as e:
+        print(f"db_save_ticket error: {e}")
+
+def db_get_all_tickets():
+    rows = db_select("support_tickets", order_col="created_at", desc=True)
+    if rows:
+        result = []
+        for row in rows:
+            row["replies"]    = json.loads(row.get("replies", "[]") or "[]")
+            row["user_phone"] = row["phone"]
+            result.append(row)
+        return result
+    all_t = []
+    for phone, tickets in support_tickets.items():
+        for t in tickets:
+            all_t.append({**t, "user_phone": phone})
+    return sorted(all_t, key=lambda x: x.get("created", ""), reverse=True)
+
+def db_get_all_farmers():
+    rows = db_select("farmer_profiles")
+    if rows:
+        result = []
+        for row in rows:
+            extra = json.loads(row.pop("data", "{}") or "{}")
+            result.append({**row, **extra})
+        return result
+    return [{"phone": p, **v} for p, v in farmer_profiles.items()]
+
+def db_get_all_accounts():
+    rows = db_select("user_accounts")
+    if rows:
+        result = {}
+        for row in rows:
+            extra = json.loads(row.pop("data", "{}") or "{}")
+            result[row["phone"]] = {**row, **extra}
+        return result
+    return user_accounts
+
+def db_load_all():
+    if not sb:
+        print("Supabase not connected — using local files only")
+        return
+    try:
+        print("Loading data from Supabase...")
+        for row in db_select("farmer_profiles"):
+            extra = json.loads(row.pop("data", "{}") or "{}")
+            farmer_profiles[row["phone"]] = {**row, **extra}
+        for row in db_select("user_accounts"):
+            extra = json.loads(row.pop("data", "{}") or "{}")
+            user_accounts[row["phone"]] = {**row, **extra}
+        for row in db_select("premium_users"):
+            extra = json.loads(row.pop("data", "{}") or "{}")
+            premium_users[row["phone"]] = {**row, **extra}
+        for row in db_select("user_activity"):
+            extra = json.loads(row.pop("data", "{}") or "{}")
+            user_activity[row["phone"]] = {**row, **extra}
+        print(f"✅ Loaded: {len(farmer_profiles)} farmers, {len(user_accounts)} accounts")
+    except Exception as e:
+        print(f"db_load_all error: {e}")
 
 # ── WebSocket Connection Manager ───────────────────────────────
 class ConnectionManager:
@@ -138,39 +402,25 @@ user_activity      = {}
 live_price_cache   = {"data": {}, "last_updated": None}
 
 
-# ── Persistent storage path ────────────────────────────────────
-# On Render free tier, use /tmp — data persists between requests
-# but resets on redeploy. For true persistence, add a Render Disk.
-# We also backup critical data (accounts + profiles) to env var on each save.
-DATA_DIR = os.getenv("DATA_DIR", "/tmp/agrobot_data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-def data_path(fname: str) -> str:
-    return os.path.join(DATA_DIR, fname)
-
-# ── OTP storage for password reset ─────────────────────────────
-reset_otps: dict = {}   # {phone: {"otp": "123456", "expires": datetime}}
-
 def load_data():
     global marketplace, premium_users, farmer_profiles, conversations
     global buyer_requests, payment_pending, user_accounts, market_prices
-    global community_posts, community_channels, user_activity, live_price_cache
+    global community_posts, community_channels, user_activity
 
     file_defaults = {
-        "marketplace.json":       (marketplace,        []),
-        "premium_users.json":     (premium_users,      {}),
-        "farmer_profiles.json":   (farmer_profiles,    {}),
-        "conversations.json":     (conversations,      {}),
-        "buyer_requests.json":    (buyer_requests,     []),
-        "payment_pending.json":   (payment_pending,    {}),
-        "user_accounts.json":     (user_accounts,      {}),
-        "market_prices.json":     (market_prices,      {}),
-        "community_posts.json":   (community_posts,    []),
-        "community_channels.json":(community_channels, {}),
-        "user_activity.json":     (user_activity,      {}),
+        "marketplace.json":        (marketplace,        []),
+        "premium_users.json":      (premium_users,      {}),
+        "farmer_profiles.json":    (farmer_profiles,    {}),
+        "conversations.json":      (conversations,      {}),
+        "buyer_requests.json":     (buyer_requests,     []),
+        "payment_pending.json":    (payment_pending,    {}),
+        "user_accounts.json":      (user_accounts,      {}),
+        "market_prices.json":      (market_prices,      {}),
+        "community_posts.json":    (community_posts,    []),
+        "community_channels.json": (community_channels, {}),
+        "user_activity.json":      (user_activity,      {}),
     }
     for fname, (var, default) in file_defaults.items():
-        # Try DATA_DIR first, then current dir as fallback
         for path in [data_path(fname), fname]:
             try:
                 with open(path, "r") as f:
@@ -216,7 +466,6 @@ def save_data():
         "marketplace.json":        marketplace,
         "premium_users.json":      premium_users,
         "farmer_profiles.json":    farmer_profiles,
-        "conversations.json":      conversations,
         "buyer_requests.json":     buyer_requests,
         "payment_pending.json":    payment_pending,
         "user_accounts.json":      user_accounts,
@@ -231,8 +480,8 @@ def save_data():
                 with open(path, "w") as f:
                     json.dump(data, f)
                 break
-            except Exception as e:
-                print(f"Save error {path}: {e}")
+            except Exception:
+                pass
 
     for fname, data in [
         ("support_tickets.json", support_tickets),
@@ -244,11 +493,13 @@ def save_data():
                 with open(path, "w") as f:
                     json.dump(data, f)
                 break
-            except Exception as e:
-                print(f"Save error {path}: {e}")
+            except Exception:
+                pass
 
 
+# Load local files first, then override with Supabase data
 load_data()
+db_load_all()
 
 # ══════════════════════════════════════════════════════════════
 # ── LIVE MARKET PRICES ─────────────────────────────────────────
@@ -2915,29 +3166,29 @@ def hash_password(password: str) -> str:
 
 
 def build_user_response(phone: str, token: str) -> dict:
-    """Build standard user response object."""
+    """Build standard user response — loads from Supabase if needed."""
+    if phone not in farmer_profiles:
+        db_get_profile(phone)
+    if phone not in user_accounts:
+        db_get_account(phone)
     stats = get_user_stats(phone)
     return {
         "success":         True,
         "token":           token,
         "phone":           phone,
         "profile":         farmer_profiles.get(phone, {}),
-        "account":         user_accounts.get(phone, {}),
+        "account":         {k: v for k, v in user_accounts.get(phone, {}).items()
+                            if k != "password_hash"},
         "premium":         is_premium(phone),
         "plan":            get_plan(phone),
         "trial_days_left": get_trial_days_left(phone),
         "stats":           stats,
-        "conversations":   conversations.get(phone, [])[-20:],
+        "conversations":   db_get_conversations(phone, 20),
     }
 
 
 @app.post("/api/register")
 async def register_user(request: Request):
-    """
-    Register a new user OR update existing user profile.
-    If password provided → full registration with password protection.
-    If no password → legacy registration (WhatsApp sync only).
-    """
     body     = await request.json()
     phone    = body.get("phone", "").strip()
     password = body.get("password", "").strip()
@@ -2948,48 +3199,45 @@ async def register_user(request: Request):
 
     now = datetime.datetime.now().isoformat()
 
-    # ── NEW REGISTRATION WITH PASSWORD ─────────────────────────
     if password:
         if len(password) < 4:
             return JSONResponse({"error": "Password must be at least 4 characters"}, status_code=400)
 
-        # Check if already registered
-        if phone in user_accounts and user_accounts[phone].get("password_hash"):
+        # Check Supabase for existing account
+        existing = db_get_account(phone)
+        if existing and existing.get("password_hash"):
             return JSONResponse({
-                "error":       "already_registered",
-                "message":     "This number is already registered. Please login instead.",
+                "error":   "already_registered",
+                "message": "This number is already registered. Please login instead.",
             }, status_code=409)
 
-        # Create account
-        hashed = hash_password(password)
-        user_accounts[phone] = {
+        hashed      = hash_password(password)
+        token       = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
+        account_data = {
             "phone":         phone,
             "name":          name,
             "password_hash": hashed,
             "platforms":     [body.get("platform", "web")],
             "registered":    now,
             "last_login":    now,
+            "last_token":    token,
         }
+        db_save_account(phone, account_data)
 
-        # Create farmer profile if not exists
-        if phone not in farmer_profiles:
-            farmer_profiles[phone] = {
-                "name":   name,
-                "joined": now,
-            }
+        profile = db_get_profile(phone) or {}
+        if not profile:
+            profile = {"name": name, "joined": now}
         elif name:
-            farmer_profiles[phone]["name"] = name
+            profile["name"] = name
+        db_save_profile(phone, profile)
 
-        token = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
-        user_accounts[phone]["last_token"] = token
         track_activity(phone, "register")
-        save_data()
-
         return JSONResponse(build_user_response(phone, token))
 
-    # ── LEGACY REGISTRATION (no password — WhatsApp sync) ──────
-    if phone not in user_accounts:
-        user_accounts[phone] = {
+    # Legacy — no password
+    existing = db_get_account(phone)
+    if not existing:
+        existing = {
             "phone":     phone,
             "name":      name,
             "platforms": [body.get("platform", "web")],
@@ -2997,27 +3245,29 @@ async def register_user(request: Request):
             "last_login":now,
         }
     else:
-        for f in ["name", "email", "google_id"]:
-            if body.get(f):
-                user_accounts[phone][f] = body[f]
+        if name: existing["name"] = name
         plat = body.get("platform", "web")
-        if plat not in user_accounts[phone].get("platforms", []):
-            user_accounts[phone].setdefault("platforms", []).append(plat)
-
-    if name and phone in farmer_profiles:
-        farmer_profiles[phone]["name"] = name
+        if plat not in existing.get("platforms", []):
+            existing.setdefault("platforms", []).append(plat)
 
     token = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
-    user_accounts[phone]["last_token"] = token
-    track_activity(phone, "login")
-    save_data()
+    existing["last_token"] = token
+    existing["last_login"] = now
+    db_save_account(phone, existing)
 
+    profile = db_get_profile(phone) or {}
+    if not profile:
+        db_save_profile(phone, {"name": name, "joined": now})
+    elif name:
+        profile["name"] = name
+        db_save_profile(phone, profile)
+
+    track_activity(phone, "login")
     return JSONResponse(build_user_response(phone, token))
 
 
 @app.post("/api/login")
 async def login_user(request: Request):
-    """Login with phone + password. Returns user data + token."""
     body     = await request.json()
     phone    = body.get("phone", "").strip()
     password = body.get("password", "").strip()
@@ -3025,221 +3275,32 @@ async def login_user(request: Request):
     if not phone or not password:
         return JSONResponse({"error": "Phone and password required"}, status_code=400)
 
-    # Check account exists
-    if phone not in user_accounts:
+    account = db_get_account(phone)
+    if not account:
         return JSONResponse({
             "error":   "not_registered",
             "message": "No account found. Please register first.",
         }, status_code=404)
 
-    account = user_accounts[phone]
-
-    # Check if account has a password set
     if not account.get("password_hash"):
-        # Legacy account — no password set, allow login and prompt to set password
         token = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
-        account["last_token"] = account.get("last_token", token)
+        account["last_token"] = token
         account["last_login"] = datetime.datetime.now().isoformat()
-        save_data()
+        db_save_account(phone, account)
         track_activity(phone, "login")
-        resp = build_user_response(phone, account["last_token"])
+        resp = build_user_response(phone, token)
         resp["needs_password_setup"] = True
         return JSONResponse(resp)
 
-    # Verify password
     if account["password_hash"] != hash_password(password):
-        return JSONResponse({
-            "error":   "wrong_password",
-            "message": "Incorrect password. Please try again.",
-        }, status_code=401)
+        return JSONResponse({"error": "wrong_password", "message": "Incorrect password."}, status_code=401)
 
-    # Success — generate new token
     token = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
     account["last_token"] = token
     account["last_login"] = datetime.datetime.now().isoformat()
-    save_data()
+    db_save_account(phone, account)
     track_activity(phone, "login")
-
     return JSONResponse(build_user_response(phone, token))
-
-
-@app.post("/api/change-password")
-async def change_password(request: Request):
-    """Change user password. Requires phone + old password + new password."""
-    body         = await request.json()
-    phone        = body.get("phone", "").strip()
-    old_password = body.get("old_password", "").strip()
-    new_password = body.get("new_password", "").strip()
-
-    if not phone or not old_password or not new_password:
-        return JSONResponse({"error": "Phone, old password and new password required"}, status_code=400)
-
-    if len(new_password) < 4:
-        return JSONResponse({"error": "New password must be at least 4 characters"}, status_code=400)
-
-    if phone not in user_accounts:
-        return JSONResponse({"error": "Account not found"}, status_code=404)
-
-    account = user_accounts[phone]
-
-    # Verify old password
-    if account.get("password_hash") and account["password_hash"] != hash_password(old_password):
-        return JSONResponse({"error": "Current password is incorrect"}, status_code=401)
-
-    # Update password
-    account["password_hash"]    = hash_password(new_password)
-    account["password_changed"] = datetime.datetime.now().isoformat()
-    save_data()
-
-    return JSONResponse({
-        "success": True,
-        "message": "Password changed successfully",
-    })
-
-
-@app.post("/api/verify-token")
-async def verify_token(request: Request):
-    """Verify a saved token to auto-login returning users. Fast — no DB queries."""
-    body  = await request.json()
-    phone = body.get("phone", "").strip()
-    token = body.get("token", "").strip()
-
-    if not phone or not token:
-        return JSONResponse({"error": "Phone and token required"}, status_code=400)
-
-    account = user_accounts.get(phone, {})
-    if account.get("last_token") != token:
-        return JSONResponse({"error": "Invalid or expired token"}, status_code=401)
-
-    account["last_login"] = datetime.datetime.now().isoformat()
-    # Don't call save_data() here — keep auto-login fast
-    track_activity(phone, "auto_login")
-
-    return JSONResponse(build_user_response(phone, token))
-
-
-@app.post("/api/forgot-password")
-async def forgot_password(request: Request):
-    """
-    Step 1 of password recovery.
-    Generates a 6-digit OTP and sends it via WhatsApp to the registered number.
-    """
-    body  = await request.json()
-    phone = body.get("phone", "").strip()
-
-    if not phone:
-        return JSONResponse({"error": "Phone required"}, status_code=400)
-
-    if phone not in user_accounts:
-        return JSONResponse({
-            "error":   "not_registered",
-            "message": "No account found for this number.",
-        }, status_code=404)
-
-    # Generate 6-digit OTP
-    otp     = str(secrets.randbelow(900000) + 100000)
-    expires = datetime.datetime.now() + datetime.timedelta(minutes=10)
-
-    reset_otps[phone] = {
-        "otp":     otp,
-        "expires": expires.isoformat(),
-        "used":    False,
-    }
-
-    # Send OTP via WhatsApp
-    msg = f"""🔐 *AgroBot Password Reset*
-{COMPANY_NAME}
-━━━━━━━━━━━━━━━━━━━━━━
-Your reset code is:
-
-*{otp}*
-
-⏰ Expires in 10 minutes.
-Do NOT share this code with anyone.
-
-If you did not request this,
-ignore this message.
-━━━━━━━━━━━━━━━━━━━━━━
-📞 {SUPPORT_PHONE}"""
-
-    send_whatsapp_message(phone, msg)
-
-    return JSONResponse({
-        "success": True,
-        "message": f"Reset code sent to WhatsApp ending in ...{phone[-4:]}",
-    })
-
-
-@app.post("/api/reset-password")
-async def reset_password(request: Request):
-    """
-    Step 2 of password recovery.
-    Verifies OTP and sets new password.
-    """
-    body         = await request.json()
-    phone        = body.get("phone", "").strip()
-    otp          = body.get("otp", "").strip()
-    new_password = body.get("new_password", "").strip()
-
-    if not phone or not otp or not new_password:
-        return JSONResponse({"error": "Phone, OTP and new password required"}, status_code=400)
-
-    if len(new_password) < 4:
-        return JSONResponse({"error": "Password must be at least 4 characters"}, status_code=400)
-
-    # Check OTP exists
-    stored = reset_otps.get(phone)
-    if not stored:
-        return JSONResponse({"error": "No reset code found. Please request a new one."}, status_code=400)
-
-    # Check not already used
-    if stored.get("used"):
-        return JSONResponse({"error": "Reset code already used. Please request a new one."}, status_code=400)
-
-    # Check expiry
-    try:
-        expires = datetime.datetime.fromisoformat(stored["expires"])
-        if datetime.datetime.now() > expires:
-            del reset_otps[phone]
-            return JSONResponse({"error": "Reset code expired. Please request a new one."}, status_code=400)
-    except Exception:
-        return JSONResponse({"error": "Invalid reset code."}, status_code=400)
-
-    # Verify OTP
-    if stored["otp"] != otp:
-        return JSONResponse({"error": "Incorrect reset code. Please try again."}, status_code=401)
-
-    # Mark OTP as used
-    reset_otps[phone]["used"] = True
-
-    # Update password
-    if phone not in user_accounts:
-        user_accounts[phone] = {
-            "phone":     phone,
-            "registered":datetime.datetime.now().isoformat(),
-        }
-
-    user_accounts[phone]["password_hash"]    = hash_password(new_password)
-    user_accounts[phone]["password_changed"] = datetime.datetime.now().isoformat()
-
-    # Auto-login after reset
-    token = hashlib.sha256(f"{phone}{secrets.token_hex(16)}".encode()).hexdigest()
-    user_accounts[phone]["last_token"] = token
-    user_accounts[phone]["last_login"] = datetime.datetime.now().isoformat()
-    save_data()
-    track_activity(phone, "password_reset")
-
-    # Send confirmation
-    send_whatsapp_message(phone,
-        f"✅ *Password Reset Successful*\n{COMPANY_NAME}\n\n"
-        f"Your password has been updated.\n"
-        f"You are now logged in.\n\n"
-        f"📞 {SUPPORT_PHONE}")
-
-    return JSONResponse(build_user_response(phone, token))
-
-
-
 
 
 @app.get("/api/farmer/{phone}")
