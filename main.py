@@ -3323,10 +3323,11 @@ async def get_farmer(phone: str):
 
 @app.get("/api/farmer/{phone}/conversations")
 async def get_conversations(phone: str, limit: int = 50):
+    convos = db_get_conversations(phone, limit)
     return JSONResponse({
         "phone":         phone,
-        "total":         len(conversations.get(phone, [])),
-        "conversations": conversations.get(phone, [])[-limit:],
+        "total":         len(convos),
+        "conversations": convos,
     })
 
 
